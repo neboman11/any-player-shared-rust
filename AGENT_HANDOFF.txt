@@ -1,0 +1,234 @@
+Any Player Shared Rust Migration - Agent Handoff
+Updated: 2026-02-18
+
+Scope completed in this increment
+1) Step 0 completed: Android Spotify client ID baseline restored.
+   - Changed file:
+     /home/nesbitt/Desktop/any-player-android/app/src/main/java/com/anyplayer/android/core/network/SpotifyClientIds.kt
+   - Behavior now uses BuildConfig.SPOTIFY_CLIENT_ID (app-owned config) instead of the temporary librespot override.
+
+2) Step 1 completed: Shared Rust workspace scaffolded.
+   - Root:
+     /home/nesbitt/Desktop/any-player-shared-rust/Cargo.toml
+   - Crates created:
+     crates/any_player_core
+     crates/any_player_spotify_engine
+     crates/any_player_ffi_android
+   - CI workflow added:
+     .github/workflows/ci.yml (runs: cargo check --workspace)
+   - Misc:
+     .gitignore added for /target and Cargo.lock
+     any_player_ffi_android configured with crate-type = ["cdylib", "rlib"]
+
+3) Step 2 completed: Portable models and provider contracts moved into any_player_core.
+   - Changed files:
+     /home/nesbitt/Desktop/any-player-shared-rust/crates/any_player_core/Cargo.toml
+     /home/nesbitt/Desktop/any-player-shared-rust/crates/any_player_core/src/lib.rs
+     /home/nesbitt/Desktop/any-player-shared-rust/crates/any_player_core/src/models.rs
+     /home/nesbitt/Desktop/any-player-shared-rust/crates/any_player_core/src/providers.rs
+   - Added shared modules:
+     - any_player_core::models (ported from desktop models module)
+     - any_player_core::providers
+       - ProviderError
+       - ProviderAuthRequest / ProviderAuthResponse
+       - MusicProvider trait
+       - ProviderRegistry + ProviderHandle (platform-agnostic, no keyring/tauri coupling)
+    - Compatibility guard:
+      - No tauri/keyring/rodio usage in shared crates after Step 2 extraction.
+
+4) Step 3 completed: Provider API contracts and shared HTTP service modules extracted.
+   - Changed files:
+     /home/nesbitt/Desktop/any-player-shared-rust/crates/any_player_core/Cargo.toml
+     /home/nesbitt/Desktop/any-player-shared-rust/crates/any_player_core/src/lib.rs
+     /home/nesbitt/Desktop/any-player-shared-rust/crates/any_player_core/src/provider_api.rs
+     /home/nesbitt/Desktop/any-player-shared-rust/crates/any_player_core/src/provider_clients/mod.rs
+     /home/nesbitt/Desktop/any-player-shared-rust/crates/any_player_core/src/provider_clients/spotify.rs
+     /home/nesbitt/Desktop/any-player-shared-rust/crates/any_player_core/src/provider_clients/jellyfin.rs
+     /home/nesbitt/Desktop/any-player-shared-rust/crates/any_player_core/src/provider_clients/plex.rs
+   - Added shared contracts:
+     - any_player_core::provider_api::AuthFlow (platform-owned orchestration boundary)
+     - any_player_core::provider_api::ProviderApi (shared provider HTTP/domain interface)
+     - any_player_core::provider_api::ProviderConnectionCheck
+   - Added shared provider HTTP services:
+     - SpotifyApiClient (token validation, playlists, track fetch/search, stream URI mapping)
+     - JellyfinApiClient (connection/user resolution, playlists/tracks/search, stream URL/auth headers)
+     - PlexApiClient (connection check, playlists/tracks/search parsing and stream URL lookup)
+   - Compatibility guard:
+     - No tauri/keyring/rodio/cpal/localhost assumptions in shared Step 3 modules.
+
+5) Step 4 completed: Spotify session engine extracted into any_player_spotify_engine.
+   - Changed files:
+     /home/nesbitt/Desktop/any-player-shared-rust/crates/any_player_spotify_engine/Cargo.toml
+     /home/nesbitt/Desktop/any-player-shared-rust/crates/any_player_spotify_engine/src/lib.rs
+   - Added shared runtime-agnostic engine primitives:
+     - SpotifySessionConfig (injected client_id)
+     - SpotifyToken (access/refresh/expiry DTO)
+     - SpotifySessionBackend trait (platform-owned backend adapter)
+     - SpotifyTokenRefresher trait (platform-owned refresh orchestration)
+     - SpotifySessionEngine with lifecycle methods:
+       - initialize_with_token(...)
+       - refresh_if_needed(...)
+       - is_ready()
+       - close()
+   - Added unit tests validating init/refresh/close flows.
+   - Compatibility guard:
+     - No Tauri/keyring/rodio/cpal/localhost callback assumptions in any_player_spotify_engine.
+
+6) Step 5 completed: Desktop adapter wired to shared Spotify engine.
+   - Changed files:
+     /home/nesbitt/Desktop/any-player/src-tauri/Cargo.toml
+     /home/nesbitt/Desktop/any-player/src-tauri/src/playback/spotify_session.rs
+   - Desktop integration changes:
+     - Added path dependency from desktop app to shared crate:
+       any_player_spotify_engine = { path = "../../any-player-shared-rust/crates/any_player_spotify_engine" }
+     - Replaced local session state implementation with thin adapter wrapping shared
+       SpotifySessionEngine while keeping existing playback manager call surface:
+       - new(client_id)
+       - is_initialized()
+       - initialize_with_oauth_token(...)
+       - get_access_token()
+       - get_session()
+       - close_session()
+     - Implemented DesktopLibrespotBackend for SpotifySessionBackend using librespot Session connect/shutdown.
+   - Compatibility guard:
+     - Tauri command/websocket/event surface unchanged.
+
+7) Step 6 completed: Android FFI adapter and Kotlin JNI bridge (narrow token/session flow).
+   - Changed files (shared rust):
+     /home/nesbitt/Desktop/any-player-shared-rust/crates/any_player_ffi_android/Cargo.toml
+     /home/nesbitt/Desktop/any-player-shared-rust/crates/any_player_ffi_android/src/lib.rs
+   - Added JNI exports (JSON responses):
+     - init(config_json)
+     - spotifyBeginAuth(config_json)
+     - spotifyExchangeCode(code, verifier, redirect) -> structured platform-auth-required error
+     - spotifyValidateToken(token_input)
+     - spotifyInitSession(token_input)
+     - spotifySessionReady()
+   - Shared-engine usage in FFI:
+     - any_player_ffi_android now uses any_player_spotify_engine through a platform backend adapter
+     - global bridge state + runtime for JNI entry points
+
+   - Changed files (android):
+     /home/nesbitt/Desktop/any-player-android/app/src/main/java/com/anyplayer/android/core/rust/RustBridgeNative.kt
+     /home/nesbitt/Desktop/any-player-android/app/src/main/java/com/anyplayer/android/core/rust/RustBridge.kt
+     /home/nesbitt/Desktop/any-player-android/app/src/main/java/com/anyplayer/android/feature/auth/ProviderAuthRepositoryImpl.kt
+   - Android integration details:
+     - Added System.loadLibrary("any_player_ffi_android") loader with safe availability fallback.
+     - Added RustBridge wrapper methods for token validation/session init readiness checks.
+     - Wired narrow flow in ProviderAuthRepositoryImpl so Spotify playbackReady uses Rust bridge when available, with Kotlin fallback preserved when JNI is unavailable or bridge call fails.
+   - Compatibility guard:
+     - Spotify auth orchestration remains platform-owned in Kotlin.
+     - No Tauri/keyring/rodio/cpal added to shared crates.
+
+8) Step 7 completed: Android arm64 native artifact wiring + smoke validation hardening.
+   - Changed files:
+     /home/nesbitt/Desktop/any-player-android/app/build.gradle.kts
+     /home/nesbitt/Desktop/any-player-shared-rust/crates/any_player_ffi_android/src/lib.rs
+   - Android build wiring:
+     - Added Gradle task `buildRustFfiArm64` to compile `any_player_ffi_android` for target `aarch64-linux-android`.
+     - Added task `syncRustFfiArm64` to copy `libany_player_ffi_android.so` into:
+       /home/nesbitt/Desktop/any-player-android/app/src/main/jniLibs/arm64-v8a
+     - Hooked `preBuild` -> `syncRustFfiArm64`.
+     - Restricted first ABI rollout to arm64-v8a (`defaultConfig.ndk.abiFilters += "arm64-v8a"`).
+   - Smoke checks added in Rust FFI crate:
+     - smoke_spotify_token_session_readiness_flow
+     - spotify_exchange_code_reports_platform_auth_required
+   - Packaging verification:
+     - Confirmed debug APK contains `lib/arm64-v8a/libany_player_ffi_android.so`.
+   - Compatibility guard:
+     - Platform-owned auth orchestration unchanged.
+     - JNI fallback path in Kotlin still intact if native lib load fails.
+
+9) Step 8 completed (post-brief hardening): expanded Android Rust FFI ABI coverage to x86_64.
+   - Changed files:
+     /home/nesbitt/Desktop/any-player-android/app/build.gradle.kts
+   - Build pipeline updates:
+     - Added x86_64 Rust build task: `buildRustFfiX8664`
+     - Added x86_64 sync task: `syncRustFfiX8664`
+     - `preBuild` now depends on both arm64 and x86_64 sync tasks
+     - Expanded ABI filters to include `x86_64` alongside `arm64-v8a`
+   - Packaging verification:
+     - APK now contains both:
+       - lib/arm64-v8a/libany_player_ffi_android.so
+       - lib/x86_64/libany_player_ffi_android.so
+
+10) Step 9 completed (post-brief hardening): expanded Android Rust FFI ABI coverage to armeabi-v7a and x86.
+   - Changed files:
+     /home/nesbitt/Desktop/any-player-android/app/build.gradle.kts
+   - Build pipeline updates:
+     - Added armv7 Rust build/sync tasks:
+       - buildRustFfiArmv7
+       - syncRustFfiArmv7
+     - Added x86 Rust build/sync tasks:
+       - buildRustFfiX86
+       - syncRustFfiX86
+     - `preBuild` now depends on all four sync tasks (arm64-v8a, x86_64, armeabi-v7a, x86)
+     - Expanded ABI filters to include all four ABIs.
+   - Packaging verification:
+     - APK now contains:
+       - lib/arm64-v8a/libany_player_ffi_android.so
+       - lib/x86_64/libany_player_ffi_android.so
+       - lib/armeabi-v7a/libany_player_ffi_android.so
+       - lib/x86/libany_player_ffi_android.so
+
+11) Step 10 completed: cross-project audit against original brief + emulator deployment.
+   - Audit scope:
+     - /home/nesbitt/Desktop/any-player-shared-rust
+     - /home/nesbitt/Desktop/any-player
+     - /home/nesbitt/Desktop/any-player-android
+   - Missed items identified:
+     - Desktop still does not consume `any_player_core`; local models/providers remain primary runtime path.
+     - Android Rust auth helper exports (`spotifyBeginAuth` / `spotifyExchangeCode`) are present but not wired into auth repository flow (Kotlin remains source of truth).
+     - Android fallback in `resolveSpotifyPlaybackReady` returns `true` when Rust bridge is unavailable, which may over-report readiness.
+   - Emulator deployment:
+     - Built latest debug app via Gradle.
+     - Installed to running emulator `emulator-5554` via adb.
+     - Launched `com.anyplayer.android/.MainActivity` for manual testing.
+
+12) Step 11 completed: fixed discovered audit gaps across desktop and android.
+   - Changed files (desktop):
+     /home/nesbitt/Desktop/any-player/src-tauri/Cargo.toml
+     /home/nesbitt/Desktop/any-player/src-tauri/src/models/mod.rs
+     /home/nesbitt/Desktop/any-player/src-tauri/src/providers/mod.rs
+   - Desktop gap fixes:
+     - Added dependency on `any_player_core`.
+     - Switched desktop models module to shared model re-export (`pub use any_player_core::models::*;`).
+     - Switched provider contract exports to shared `any_player_core::providers` types while preserving desktop-specific ProviderRegistry behavior.
+
+   - Changed files (android):
+     /home/nesbitt/Desktop/any-player-android/app/src/main/java/com/anyplayer/android/feature/auth/ProviderAuthRepositoryImpl.kt
+   - Android gap fixes:
+     - Wired Rust helper `spotifyBeginAuth` into begin-auth path (with Kotlin URL fallback).
+     - Wired Rust helper `spotifyExchangeCode` into complete-auth path as platform-boundary call before Kotlin exchange.
+     - Fixed readiness fallback to conservative behavior: Rust bridge unavailability now yields `playbackReady = false` instead of implicit true.
+   - Emulator deployment:
+     - Reinstalled updated debug APK to `emulator-5554`.
+     - Relaunched `com.anyplayer.android/.MainActivity`.
+
+Validation run and status
+- Shared workspace: cargo check --workspace -> SUCCESS
+- Shared spotify engine: cargo test -p any_player_spotify_engine -> SUCCESS
+- Desktop app (Step 5): (cd /home/nesbitt/Desktop/any-player/src-tauri && cargo check) -> SUCCESS
+- Android app (Step 6): ./gradlew :app:assembleDebug -> SUCCESS
+- Shared FFI smoke/tests (Step 7): cargo test -p any_player_ffi_android -> SUCCESS
+- Shared FFI arm64 build (Step 7): cargo build -p any_player_ffi_android --target aarch64-linux-android --release -> SUCCESS
+- Android app (Step 7): ./gradlew :app:assembleDebug -> SUCCESS
+- Android app (Step 8): ./gradlew :app:assembleDebug -> SUCCESS
+- APK verification (Step 8): arm64-v8a + x86_64 libany_player_ffi_android.so present -> SUCCESS
+- Android app (Step 9): ./gradlew :app:assembleDebug -> SUCCESS
+- APK verification (Step 9): arm64-v8a + x86_64 + armeabi-v7a + x86 libany_player_ffi_android.so present -> SUCCESS
+- Android app deploy (Step 10): assembleDebug + adb install + activity launch on emulator-5554 -> SUCCESS
+- Desktop app (Step 11): (cd /home/nesbitt/Desktop/any-player/src-tauri && cargo check) -> SUCCESS
+- Android app (Step 11): ./gradlew :app:assembleDebug -> SUCCESS
+- Android app deploy (Step 11): adb install -r + launch MainActivity on emulator-5554 -> SUCCESS
+
+Important context for next agent
+- Keep scope incremental per migration brief.
+- Steps 0-7 from the migration brief are implemented in this environment.
+- Likely next work items are follow-up hardening:
+  - replace additional Kotlin-only Spotify/session surfaces with shared Rust FFI incrementally
+  - add richer integration tests around OAuth/login roundtrip and session readiness transitions
+  - reduce duplicated Gradle Rust task wiring by consolidating ABI matrix build logic (optional cleanup)
+  - integrate `any_player_core` into desktop runtime path (providers/models) to complete core sharing intent
+  - integrate `any_player_core` deeper into desktop provider implementation internals (current fix moved shared contracts/models, registry remains desktop-specific)
+- Neither /home/nesbitt/Desktop/any-player-android nor /home/nesbitt/Desktop/any-player-shared-rust is a git repository in this environment, so no PR was opened here.

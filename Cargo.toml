@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "crates/any_player_core",
+    "crates/any_player_spotify_engine",
+    "crates/any_player_ffi_android",
+]
+resolver = "2"
+
