@@ -121,7 +121,7 @@ impl JellyfinApiClient {
         Ok(raw_url.trim_end_matches('/').to_string())
     }
 
-    fn api_key<'a>(session: &'a ProviderAuthRequest) -> Result<&'a str, ProviderError> {
+    fn api_key(session: &ProviderAuthRequest) -> Result<&str, ProviderError> {
         Self::required_param(session, "api_key")
     }
 
@@ -197,34 +197,32 @@ impl JellyfinApiClient {
             .get("user_id")
             .map(str::trim)
             .filter(|value| !value.is_empty())
+            && let Some(user) = users.iter().find(|user| user.id == configured_user_id)
         {
-            if let Some(user) = users.iter().find(|user| user.id == configured_user_id) {
-                return Ok(user.clone());
-            }
+            return Ok(user.clone());
         }
 
         Ok(users[0].clone())
     }
 
     fn get_image_url(base_url: &str, api_key: &str, item: &JellyfinItem) -> Option<String> {
-        if item.item_type == "Audio" {
-            if let (Some(album_id), Some(album_tag)) =
+        if item.item_type == "Audio"
+            && let (Some(album_id), Some(album_tag)) =
                 (&item.album_id, &item.album_primary_image_tag)
-            {
-                return Some(format!(
-                    "{}/Items/{}/Images/Primary?tag={}&api_key={}",
-                    base_url, album_id, album_tag, api_key
-                ));
-            }
+        {
+            return Some(format!(
+                "{}/Items/{}/Images/Primary?tag={}&api_key={}",
+                base_url, album_id, album_tag, api_key
+            ));
         }
 
-        if let Some(tags) = &item.image_tags {
-            if let Some(primary_tag) = tags.get("Primary").and_then(Value::as_str) {
-                return Some(format!(
-                    "{}/Items/{}/Images/Primary?tag={}&api_key={}",
-                    base_url, item.id, primary_tag, api_key
-                ));
-            }
+        if let Some(tags) = &item.image_tags
+            && let Some(primary_tag) = tags.get("Primary").and_then(Value::as_str)
+        {
+            return Some(format!(
+                "{}/Items/{}/Images/Primary?tag={}&api_key={}",
+                base_url, item.id, primary_tag, api_key
+            ));
         }
 
         None
@@ -244,41 +242,41 @@ impl JellyfinApiClient {
     }
 
     fn get_audio_quality(item: &JellyfinItem) -> (Option<u32>, Option<u32>) {
-        if let Some(sources) = &item.media_sources {
-            if let Some(source) = sources.first() {
-                if let Some(streams) = &source.media_streams {
-                    if let Some(audio_stream) = streams.iter().find(|stream| {
-                        stream
-                            .stream_type
-                            .as_deref()
-                            .map(|value| value.eq_ignore_ascii_case("Audio"))
-                            .unwrap_or(false)
-                    }) {
-                        let bitrate_kbps = audio_stream.bit_rate.map(|value| value / 1000);
-                        let fallback_bitrate = source.bitrate.map(|value| value / 1000);
-                        return (bitrate_kbps.or(fallback_bitrate), audio_stream.sample_rate);
-                    }
-                }
+        if let Some(sources) = &item.media_sources
+            && let Some(source) = sources.first()
+        {
+            if let Some(streams) = &source.media_streams
+                && let Some(audio_stream) = streams.iter().find(|stream| {
+                    stream
+                        .stream_type
+                        .as_deref()
+                        .map(|value| value.eq_ignore_ascii_case("Audio"))
+                        .unwrap_or(false)
+                })
+            {
+                let bitrate_kbps = audio_stream.bit_rate.map(|value| value / 1000);
+                let fallback_bitrate = source.bitrate.map(|value| value / 1000);
+                return (bitrate_kbps.or(fallback_bitrate), audio_stream.sample_rate);
+            }
 
-                if source.bitrate.is_some() {
-                    return (source.bitrate.map(|value| value / 1000), None);
-                }
+            if source.bitrate.is_some() {
+                return (source.bitrate.map(|value| value / 1000), None);
             }
         }
 
-        if let Some(streams) = &item.media_streams {
-            if let Some(audio_stream) = streams.iter().find(|stream| {
+        if let Some(streams) = &item.media_streams
+            && let Some(audio_stream) = streams.iter().find(|stream| {
                 stream
                     .stream_type
                     .as_deref()
                     .map(|value| value.eq_ignore_ascii_case("Audio"))
                     .unwrap_or(false)
-            }) {
-                return (
-                    audio_stream.bit_rate.map(|value| value / 1000),
-                    audio_stream.sample_rate,
-                );
-            }
+            })
+        {
+            return (
+                audio_stream.bit_rate.map(|value| value / 1000),
+                audio_stream.sample_rate,
+            );
         }
 
         (item.bitrate.map(|value| value / 1000), item.sample_rate)

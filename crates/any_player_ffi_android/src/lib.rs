@@ -994,14 +994,13 @@ fn handle_spotify_snapshot() -> String {
                 state.playback_repeat_mode = repeat_mode;
                 state.playback_current_track_id = current_track_id.clone();
 
-                if let Some(track_id) = current_track_id.as_ref() {
-                    if let Some(index) = state
+                if let Some(track_id) = current_track_id.as_ref()
+                    && let Some(index) = state
                         .playback_queue
                         .iter()
                         .position(|entry| entry == track_id)
-                    {
-                        state.playback_index = index;
-                    }
+                {
+                    state.playback_index = index;
                 }
             }
 

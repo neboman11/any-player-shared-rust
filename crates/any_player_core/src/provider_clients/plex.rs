@@ -98,7 +98,7 @@ impl PlexApiClient {
         Ok(url.trim_end_matches('/').to_string())
     }
 
-    fn session_token<'a>(session: &'a ProviderAuthRequest) -> Result<&'a str, ProviderError> {
+    fn session_token(session: &ProviderAuthRequest) -> Result<&str, ProviderError> {
         Self::required_param(session, "token")
     }
 
