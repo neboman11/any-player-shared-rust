@@ -68,10 +68,7 @@ pub trait SpotifySessionBackend: Send + Sync {
         access_token: &str,
     ) -> Result<Self::SessionHandle, SpotifyEngineError>;
 
-    async fn disconnect(
-        &self,
-        session: &Self::SessionHandle,
-    ) -> Result<(), SpotifyEngineError>;
+    async fn disconnect(&self, session: &Self::SessionHandle) -> Result<(), SpotifyEngineError>;
 }
 
 /// Platform-owned token refresh strategy.
@@ -167,7 +164,10 @@ impl<B: SpotifySessionBackend> SpotifySessionEngine<B> {
     }
 
     /// Initialize or reinitialize the backend session with a token.
-    pub async fn initialize_with_token(&self, mut token: SpotifyToken) -> Result<(), SpotifyEngineError> {
+    pub async fn initialize_with_token(
+        &self,
+        mut token: SpotifyToken,
+    ) -> Result<(), SpotifyEngineError> {
         self.config.validate()?;
         token.access_token = token.access_token.trim().to_string();
         if token.access_token.is_empty() {
@@ -208,7 +208,10 @@ impl<B: SpotifySessionBackend> SpotifySessionEngine<B> {
         let token = {
             let state = self.state.lock().await;
             state.token.clone().ok_or_else(|| {
-                SpotifyEngineError::new("spotify_session_missing_token", "Spotify token is not initialized")
+                SpotifyEngineError::new(
+                    "spotify_session_missing_token",
+                    "Spotify token is not initialized",
+                )
             })?
         };
 
@@ -305,7 +308,10 @@ mod tests {
             _config: &SpotifySessionConfig,
             access_token: &str,
         ) -> Result<Self::SessionHandle, SpotifyEngineError> {
-            self.connect_calls.lock().await.push(access_token.to_string());
+            self.connect_calls
+                .lock()
+                .await
+                .push(access_token.to_string());
             Ok(format!("session:{}", access_token))
         }
 
@@ -355,7 +361,8 @@ mod tests {
     #[tokio::test]
     async fn refresh_if_needed_is_noop_for_valid_token() {
         let backend = MockBackend::default();
-        let engine = SpotifySessionEngine::new(SpotifySessionConfig::new("client"), backend.clone());
+        let engine =
+            SpotifySessionEngine::new(SpotifySessionConfig::new("client"), backend.clone());
         let valid_until = current_epoch_seconds() + 3_600;
 
         engine
@@ -417,7 +424,8 @@ mod tests {
     #[tokio::test]
     async fn close_clears_state() {
         let backend = MockBackend::default();
-        let engine = SpotifySessionEngine::new(SpotifySessionConfig::new("client"), backend.clone());
+        let engine =
+            SpotifySessionEngine::new(SpotifySessionConfig::new("client"), backend.clone());
 
         engine
             .initialize_with_token(SpotifyToken::with_access_token("token-1"))

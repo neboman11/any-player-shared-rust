@@ -15,3 +15,11 @@ jobs:
       - name: Cargo check workspace
         run: cargo check --workspace
 
+      - name: Run rustfmt
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
+        continue-on-error: ${{ contains(github.event.head_commit.message, '[skip-format]') }}
+
+      - name: Run clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets --all-features -- -D warnings

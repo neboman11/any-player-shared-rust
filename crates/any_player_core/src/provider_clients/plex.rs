@@ -111,7 +111,11 @@ impl PlexApiClient {
         }
     }
 
-    fn image_url_from_path(base_url: &str, token: &str, maybe_path: &Option<String>) -> Option<String> {
+    fn image_url_from_path(
+        base_url: &str,
+        token: &str,
+        maybe_path: &Option<String>,
+    ) -> Option<String> {
         maybe_path.as_ref().map(|path| {
             let path = path.trim_start_matches('/');
             format!("{}/{}?X-Plex-Token={}", base_url, path, token)
@@ -191,8 +195,9 @@ impl PlexApiClient {
             .text()
             .await
             .map_err(|error| ProviderError(format!("Failed to read {} body: {}", action, error)))?;
-        serde_json::from_str::<T>(&body)
-            .map_err(|error| ProviderError(format!("Failed to parse {} response: {}", action, error)))
+        serde_json::from_str::<T>(&body).map_err(|error| {
+            ProviderError(format!("Failed to parse {} response: {}", action, error))
+        })
     }
 
     async fn get_tracks_from_endpoint(
@@ -316,7 +321,12 @@ impl ProviderApi for PlexApiClient {
         let token = Self::session_token(session)?;
 
         let mut playlists = self
-            .get_playlists_from_endpoint(&base_url, token, &format!("library/metadata/{}", id), None)
+            .get_playlists_from_endpoint(
+                &base_url,
+                token,
+                &format!("library/metadata/{}", id),
+                None,
+            )
             .await?;
         let mut playlist = playlists
             .pop()
@@ -353,7 +363,8 @@ impl ProviderApi for PlexApiClient {
     ) -> Result<Vec<Track>, ProviderError> {
         let base_url = Self::session_base_url(session)?;
         let token = Self::session_token(session)?;
-        let encoded_query: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
+        let encoded_query: String =
+            url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
         self.get_tracks_from_endpoint(
             &base_url,
             token,
@@ -369,7 +380,8 @@ impl ProviderApi for PlexApiClient {
     ) -> Result<Vec<Playlist>, ProviderError> {
         let base_url = Self::session_base_url(session)?;
         let token = Self::session_token(session)?;
-        let encoded_query: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
+        let encoded_query: String =
+            url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
         self.get_playlists_from_endpoint(
             &base_url,
             token,

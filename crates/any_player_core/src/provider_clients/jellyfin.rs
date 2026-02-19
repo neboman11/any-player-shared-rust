@@ -4,8 +4,8 @@ use crate::providers::{ProviderAuthRequest, ProviderError};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client, RequestBuilder};
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -167,10 +167,9 @@ impl JellyfinApiClient {
             )));
         }
 
-        response
-            .json::<T>()
-            .await
-            .map_err(|error| ProviderError(format!("Failed to parse {} response: {}", action, error)))
+        response.json::<T>().await.map_err(|error| {
+            ProviderError(format!("Failed to parse {} response: {}", action, error))
+        })
     }
 
     async fn resolve_user(
@@ -431,7 +430,10 @@ impl ProviderApi for JellyfinApiClient {
         for _ in 0..JELLYFIN_MAX_PLAYLIST_PAGES {
             let params = vec![
                 ("ParentId".to_string(), id.to_string()),
-                ("Fields".to_string(), "AudioInfo,MediaSources,ParentId".to_string()),
+                (
+                    "Fields".to_string(),
+                    "AudioInfo,MediaSources,ParentId".to_string(),
+                ),
                 ("Limit".to_string(), limit.to_string()),
                 ("StartIndex".to_string(), start_index.to_string()),
             ];
@@ -471,7 +473,10 @@ impl ProviderApi for JellyfinApiClient {
             .send()
             .await
             .map_err(|error| {
-                ProviderError(format!("Failed to fetch Jellyfin playlist metadata: {}", error))
+                ProviderError(format!(
+                    "Failed to fetch Jellyfin playlist metadata: {}",
+                    error
+                ))
             })?;
 
         if metadata_response.status().is_success() {

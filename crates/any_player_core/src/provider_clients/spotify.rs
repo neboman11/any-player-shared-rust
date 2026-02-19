@@ -134,7 +134,10 @@ impl SpotifyApiClient {
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        let duration_ms = value.get("duration_ms").and_then(Value::as_u64).unwrap_or(0);
+        let duration_ms = value
+            .get("duration_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
 
         Some(Track {
             id: id.clone(),
@@ -289,8 +292,9 @@ impl ProviderApi for SpotifyApiClient {
             )
             .await?;
 
-        let mut playlist = Self::parse_playlist(&metadata)
-            .ok_or_else(|| ProviderError("Failed to parse Spotify playlist metadata".to_string()))?;
+        let mut playlist = Self::parse_playlist(&metadata).ok_or_else(|| {
+            ProviderError("Failed to parse Spotify playlist metadata".to_string())
+        })?;
         let tracks = tracks_response
             .get("items")
             .and_then(Value::as_array)
@@ -362,7 +366,12 @@ impl ProviderApi for SpotifyApiClient {
             .get("tracks")
             .and_then(|tracks| tracks.get("items"))
             .and_then(Value::as_array)
-            .map(|items| items.iter().filter_map(Self::parse_track).collect::<Vec<_>>())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Self::parse_track)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default())
     }
 

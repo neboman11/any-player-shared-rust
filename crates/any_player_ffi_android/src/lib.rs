@@ -3,13 +3,13 @@ use any_player_spotify_engine::{
     SpotifyToken,
 };
 use async_trait::async_trait;
+use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::jstring;
-use jni::JNIEnv;
 use once_cell::sync::Lazy;
 use reqwest::Method;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Builder, Runtime};
@@ -100,8 +100,11 @@ static TOKIO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         .build()
         .expect("failed to initialize tokio runtime for android ffi bridge")
 });
-static HTTP_CLIENT: Lazy<reqwest::Client> =
-    Lazy::new(|| reqwest::Client::builder().build().expect("spotify http client"));
+static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .build()
+        .expect("spotify http client")
+});
 
 #[derive(Clone, Default)]
 struct AndroidSpotifyBackend;
@@ -132,10 +135,7 @@ impl SpotifySessionBackend for AndroidSpotifyBackend {
         })
     }
 
-    async fn disconnect(
-        &self,
-        session: &Self::SessionHandle,
-    ) -> Result<(), SpotifyEngineError> {
+    async fn disconnect(&self, session: &Self::SessionHandle) -> Result<(), SpotifyEngineError> {
         let _ = session.initialized_at_epoch_seconds;
         Ok(())
     }
@@ -233,13 +233,8 @@ fn parse_required_json<T>(raw_json: &str, field_name: &str) -> Result<T, String>
 where
     T: for<'de> Deserialize<'de>,
 {
-    serde_json::from_str::<T>(raw_json).map_err(|error| {
-        format!(
-            "Invalid {} payload: {}",
-            field_name.trim(),
-            error
-        )
-    })
+    serde_json::from_str::<T>(raw_json)
+        .map_err(|error| format!("Invalid {} payload: {}", field_name.trim(), error))
 }
 
 fn parse_token(raw_input: &str) -> Result<SpotifyToken, String> {
@@ -372,7 +367,10 @@ async fn execute_spotify_request(
         .unwrap_or_else(|| truncate_for_error(&body_text, 220));
 
     if detail.is_empty() {
-        Err(format!("Spotify API request failed (HTTP {})", status.as_u16()))
+        Err(format!(
+            "Spotify API request failed (HTTP {})",
+            status.as_u16()
+        ))
     } else {
         Err(format!(
             "Spotify API request failed (HTTP {}): {}",
@@ -383,8 +381,8 @@ async fn execute_spotify_request(
 }
 
 async fn resolve_spotify_device_id(token: &str) -> Result<Option<String>, String> {
-    let payload = execute_spotify_request(Method::GET, "me/player/devices", token, Vec::new(), None)
-        .await?;
+    let payload =
+        execute_spotify_request(Method::GET, "me/player/devices", token, Vec::new(), None).await?;
 
     let Some(payload) = payload else {
         return Ok(None);
@@ -428,7 +426,8 @@ fn require_playback_token() -> Result<String, String> {
         .clone()
         .filter(|token| !token.trim().is_empty())
         .ok_or_else(|| {
-            "Playback token is missing. Start playback with spotifyStartQueue(...) first.".to_string()
+            "Playback token is missing. Start playback with spotifyStartQueue(...) first."
+                .to_string()
         })
 }
 
@@ -526,13 +525,22 @@ fn handle_spotify_begin_auth(config_json: &str) -> String {
 
 fn handle_spotify_exchange_code(code: &str, verifier: &str, redirect: &str) -> String {
     if code.trim().is_empty() {
-        return error_response("spotify_authorization_code_missing", "Spotify code is required");
+        return error_response(
+            "spotify_authorization_code_missing",
+            "Spotify code is required",
+        );
     }
     if verifier.trim().is_empty() {
-        return error_response("spotify_code_verifier_missing", "Spotify verifier is required");
+        return error_response(
+            "spotify_code_verifier_missing",
+            "Spotify verifier is required",
+        );
     }
     if redirect.trim().is_empty() {
-        return error_response("spotify_redirect_uri_missing", "Spotify redirect URI is required");
+        return error_response(
+            "spotify_redirect_uri_missing",
+            "Spotify redirect URI is required",
+        );
     }
 
     error_response(
@@ -597,7 +605,8 @@ fn handle_spotify_session_ready() -> String {
 }
 
 fn handle_spotify_start_queue(config_json: &str) -> String {
-    let payload = match parse_required_json::<StartQueuePayload>(config_json, "spotify_start_queue") {
+    let payload = match parse_required_json::<StartQueuePayload>(config_json, "spotify_start_queue")
+    {
         Ok(payload) => payload,
         Err(error) => return error_response("invalid_start_queue_payload", error),
     };
@@ -611,7 +620,10 @@ fn handle_spotify_start_queue(config_json: &str) -> String {
     }
 
     if payload.track_ids.is_empty() {
-        return error_response("spotify_track_ids_missing", "track_ids must include at least one track");
+        return error_response(
+            "spotify_track_ids_missing",
+            "track_ids must include at least one track",
+        );
     }
 
     let normalized_track_ids: Vec<String> = payload
@@ -761,7 +773,8 @@ fn handle_spotify_next() -> String {
             } else if state.playback_repeat_mode == RepeatModeState::All {
                 state.playback_index = 0;
             }
-            state.playback_current_track_id = state.playback_queue.get(state.playback_index).cloned();
+            state.playback_current_track_id =
+                state.playback_queue.get(state.playback_index).cloned();
             state.playback_progress_ms = 0;
         }
         state.playback_is_playing = true;
@@ -793,7 +806,8 @@ fn handle_spotify_previous() -> String {
             } else if state.playback_repeat_mode == RepeatModeState::All {
                 state.playback_index = state.playback_queue.len().saturating_sub(1);
             }
-            state.playback_current_track_id = state.playback_queue.get(state.playback_index).cloned();
+            state.playback_current_track_id =
+                state.playback_queue.get(state.playback_index).cloned();
             state.playback_progress_ms = 0;
         }
         state.playback_is_playing = true;
@@ -817,10 +831,7 @@ fn handle_spotify_seek(config_json: &str) -> String {
         Method::PUT,
         "me/player/seek",
         &token,
-        vec![(
-            "position_ms".to_string(),
-            payload.position_ms.to_string(),
-        )],
+        vec![("position_ms".to_string(), payload.position_ms.to_string())],
         Some(json!({})),
     )) {
         return error_response("spotify_playback_command_failed", error);
@@ -891,10 +902,11 @@ fn handle_spotify_set_shuffle(config_json: &str) -> String {
 }
 
 fn handle_spotify_set_repeat_mode(config_json: &str) -> String {
-    let payload = match parse_required_json::<RepeatModePayload>(config_json, "spotify_set_repeat_mode") {
-        Ok(payload) => payload,
-        Err(error) => return error_response("invalid_set_repeat_mode_payload", error),
-    };
+    let payload =
+        match parse_required_json::<RepeatModePayload>(config_json, "spotify_set_repeat_mode") {
+            Ok(payload) => payload,
+            Err(error) => return error_response("invalid_set_repeat_mode_payload", error),
+        };
 
     let mode = match RepeatModeState::from_input(&payload.mode) {
         Some(mode) => mode,
@@ -983,7 +995,11 @@ fn handle_spotify_snapshot() -> String {
                 state.playback_current_track_id = current_track_id.clone();
 
                 if let Some(track_id) = current_track_id.as_ref() {
-                    if let Some(index) = state.playback_queue.iter().position(|entry| entry == track_id) {
+                    if let Some(index) = state
+                        .playback_queue
+                        .iter()
+                        .position(|entry| entry == track_id)
+                    {
                         state.playback_index = index;
                     }
                 }
@@ -1258,7 +1274,9 @@ mod tests {
     fn spotify_exchange_code_reports_platform_auth_required() {
         let _guard = TEST_MUTEX.lock().expect("test mutex");
 
-        let payload = parse_json(&handle_spotify_exchange_code("code", "verifier", "redirect"));
+        let payload = parse_json(&handle_spotify_exchange_code(
+            "code", "verifier", "redirect",
+        ));
         assert_eq!(payload["ok"], Value::Bool(false));
         assert_eq!(
             payload["error"]["code"],
