@@ -1,13 +1,12 @@
 use any_player_spotify_engine::{
-    SpotifyEngineError, SpotifySessionBackend, SpotifySessionConfig, SpotifySessionEngine,
-    SpotifyToken,
+    LibrespotPlayer, SpotifyEngineError, SpotifySessionBackend,
+    SpotifySessionConfig, SpotifySessionEngine, SpotifyToken,
 };
 use async_trait::async_trait;
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::jstring;
 use once_cell::sync::Lazy;
-use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -35,14 +34,6 @@ impl RepeatModeState {
         }
     }
 
-    fn from_spotify_api(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "track" => Self::One,
-            "context" => Self::All,
-            _ => Self::Off,
-        }
-    }
-
     fn as_snapshot_str(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -50,28 +41,19 @@ impl RepeatModeState {
             Self::All => "all",
         }
     }
-
-    fn as_spotify_api_state(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::One => "track",
-            Self::All => "context",
-        }
-    }
 }
 
 struct BridgeState {
     client_id: Option<String>,
     engine: Option<SharedEngine>,
+    // Last access token used for playback — stored so transport commands can
+    // transparently reconnect the librespot session after expiry or app restart.
     playback_access_token: Option<String>,
+    // Local playback state mirrored for snapshot responses.
     playback_queue: Vec<String>,
     playback_index: usize,
     playback_shuffle: bool,
     playback_repeat_mode: RepeatModeState,
-    playback_volume_percent: u8,
-    playback_is_playing: bool,
-    playback_progress_ms: u64,
-    playback_current_track_id: Option<String>,
 }
 
 impl Default for BridgeState {
@@ -84,26 +66,19 @@ impl Default for BridgeState {
             playback_index: 0,
             playback_shuffle: false,
             playback_repeat_mode: RepeatModeState::Off,
-            playback_volume_percent: 100,
-            playback_is_playing: false,
-            playback_progress_ms: 0,
-            playback_current_track_id: None,
         }
     }
 }
 
 static BRIDGE_STATE: Lazy<Mutex<BridgeState>> = Lazy::new(|| Mutex::new(BridgeState::default()));
+/// The librespot player lives in its own static so it can hold async state cleanly.
+static PLAYER: Lazy<LibrespotPlayer> = Lazy::new(LibrespotPlayer::new);
 static TOKIO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("failed to initialize tokio runtime for android ffi bridge")
-});
-static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
-        .build()
-        .expect("spotify http client")
 });
 
 #[derive(Clone, Default)]
@@ -173,8 +148,6 @@ struct StartQueuePayload {
     track_ids: Vec<String>,
     #[serde(default)]
     start_index: usize,
-    #[serde(default)]
-    device_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -264,171 +237,31 @@ fn parse_token(raw_input: &str) -> Result<SpotifyToken, String> {
     Ok(SpotifyToken::with_access_token(trimmed.to_string()))
 }
 
-fn require_engine() -> Result<SharedEngine, String> {
-    let state = lock_state()?;
-    state
-        .engine
-        .clone()
-        .ok_or_else(|| "Bridge is not initialized. Call init(config_json) first.".to_string())
-}
-
+/// Accepts bare base62 track IDs ("4uLU6hMCjMI75M1A2tKUQC"),
+/// full Spotify URIs ("spotify:track:4uLU6hMCjMI75M1A2tKUQC"),
+/// and open.spotify.com URLs. Returns None for blank/invalid input.
 fn normalize_spotify_track_id(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
-
-    let normalized = if let Some(stripped) = trimmed.strip_prefix("spotify:track:") {
+    let id = if let Some(stripped) = trimmed.strip_prefix("spotify:track:") {
         stripped
     } else if let Some((_, rest)) = trimmed.split_once("/track/") {
         rest.split(['?', '/']).next().unwrap_or(rest)
     } else {
         trimmed
     };
-
-    let normalized = normalized.trim();
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized.to_string())
-    }
+    let id = id.trim();
+    if id.is_empty() { None } else { Some(id.to_string()) }
 }
 
-fn truncate_for_error(text: &str, max_chars: usize) -> String {
-    let mut out: String = text.chars().take(max_chars).collect();
-    if text.chars().count() > max_chars {
-        out.push_str("...");
-    }
-    out
-}
-
-fn extract_spotify_error_message(raw_body: &str) -> Option<String> {
-    if raw_body.trim().is_empty() {
-        return None;
-    }
-
-    let parsed = serde_json::from_str::<Value>(raw_body).ok()?;
-    let error = parsed.get("error")?;
-
-    if let Some(message) = error.get("message").and_then(Value::as_str) {
-        return Some(message.to_string());
-    }
-
-    error.as_str().map(str::to_string)
-}
-
-async fn execute_spotify_request(
-    method: Method,
-    path: &str,
-    token: &str,
-    query: Vec<(String, String)>,
-    body: Option<Value>,
-) -> Result<Option<Value>, String> {
-    let normalized_token = token.trim();
-    if normalized_token.is_empty() {
-        return Err("Spotify access token is required".to_string());
-    }
-
-    let endpoint = path.trim_start_matches('/');
-    let url = format!("https://api.spotify.com/v1/{}", endpoint);
-
-    let mut request = HTTP_CLIENT
-        .request(method, &url)
-        .bearer_auth(normalized_token)
-        .header(reqwest::header::ACCEPT, "application/json");
-
-    if !query.is_empty() {
-        request = request.query(&query);
-    }
-
-    if let Some(payload) = body {
-        request = request.json(&payload);
-    }
-
-    let response = request
-        .send()
-        .await
-        .map_err(|error| format!("Spotify API request failed: {}", error))?;
-
-    let status = response.status();
-    let body_text = response.text().await.unwrap_or_default();
-
-    if status.is_success() {
-        if body_text.trim().is_empty() {
-            return Ok(None);
-        }
-
-        return serde_json::from_str::<Value>(&body_text)
-            .map(Some)
-            .map_err(|error| format!("Failed to parse Spotify API JSON response: {}", error));
-    }
-
-    let detail = extract_spotify_error_message(&body_text)
-        .unwrap_or_else(|| truncate_for_error(&body_text, 220));
-
-    if detail.is_empty() {
-        Err(format!(
-            "Spotify API request failed (HTTP {})",
-            status.as_u16()
-        ))
-    } else {
-        Err(format!(
-            "Spotify API request failed (HTTP {}): {}",
-            status.as_u16(),
-            detail
-        ))
-    }
-}
-
-async fn resolve_spotify_device_id(token: &str) -> Result<Option<String>, String> {
-    let payload =
-        execute_spotify_request(Method::GET, "me/player/devices", token, Vec::new(), None).await?;
-
-    let Some(payload) = payload else {
-        return Ok(None);
-    };
-
-    let Some(devices) = payload.get("devices").and_then(Value::as_array) else {
-        return Ok(None);
-    };
-
-    if devices.is_empty() {
-        return Ok(None);
-    }
-
-    let preferred = devices
-        .iter()
-        .find(|device| {
-            device
-                .get("is_active")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        })
-        .or_else(|| {
-            devices.iter().find(|device| {
-                !device
-                    .get("is_restricted")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-            })
-        })
-        .or_else(|| devices.first());
-
-    Ok(preferred
-        .and_then(|device| device.get("id").and_then(Value::as_str))
-        .map(str::to_string))
-}
-
-fn require_playback_token() -> Result<String, String> {
+fn require_engine() -> Result<SharedEngine, String> {
     let state = lock_state()?;
     state
-        .playback_access_token
+        .engine
         .clone()
-        .filter(|token| !token.trim().is_empty())
-        .ok_or_else(|| {
-            "Playback token is missing. Start playback with spotifyStartQueue(...) first."
-                .to_string()
-        })
+        .ok_or_else(|| "Bridge is not initialized. Call init(config_json) first.".to_string())
 }
 
 fn handle_init(config_json: &str) -> String {
@@ -575,6 +408,13 @@ fn handle_spotify_init_session(token_input: &str) -> String {
         Err(error) => return error_response("bridge_not_initialized", error),
     };
 
+    // Persist the fresh, validated token so ensure_player_connected always has
+    // a current token after a re-auth, even before startQueue is called.
+    let access_token = token.access_token.clone();
+    if let Ok(mut state) = lock_state() {
+        state.playback_access_token = Some(access_token.clone());
+    }
+
     match TOKIO_RUNTIME.block_on(engine.initialize_with_token(token)) {
         Ok(()) => {
             let ready = TOKIO_RUNTIME.block_on(engine.is_ready());
@@ -640,177 +480,174 @@ fn handle_spotify_start_queue(config_json: &str) -> String {
     }
 
     let start_index = payload.start_index.min(normalized_track_ids.len() - 1);
-    let uris: Vec<String> = normalized_track_ids
-        .iter()
-        .map(|track_id| format!("spotify:track:{}", track_id))
-        .collect();
+    let token_owned = token.to_string();
 
-    let requested_device_id = payload
-        .device_id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-
-    let resolved_device_id = match requested_device_id {
-        Some(value) => Some(value),
-        None => match TOKIO_RUNTIME.block_on(resolve_spotify_device_id(token)) {
-            Ok(device_id) => device_id,
-            Err(error) => return error_response("spotify_device_lookup_failed", error),
-        },
+    // Read the OAuth client_id stored during init so we can pass it to
+    // librespot. Login5 binds stored credentials to the originating client ID;
+    // a mismatch produces INVALID_CREDENTIALS when loading tracks.
+    let client_id_owned = {
+        let state = match lock_state() {
+            Ok(s) => s,
+            Err(e) => return error_response("bridge_state_error", e),
+        };
+        match state.client_id.clone() {
+            Some(id) => id,
+            None => return error_response("spotify_client_id_missing", "client_id not set — call init() first"),
+        }
     };
 
-    let mut query = Vec::new();
-    if let Some(device_id) = resolved_device_id.as_ref() {
-        query.push(("device_id".to_string(), device_id.clone()));
+    // Disconnect any existing player first so startQueue always gets a clean
+    // slate. This also lets the connect() idempotency guard not block us here:
+    // concurrent ensure_player_connected() callers will wait, see is_connected()
+    // = true once our connect() finishes, and skip reconnection.
+    TOKIO_RUNTIME.block_on(PLAYER.disconnect());
+
+    // Connect librespot (establishes a real Spotify session on this device).
+    if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.connect(&token_owned, &client_id_owned)) {
+        return error_response("librespot_connect_failed", error.message);
     }
 
-    let body = json!({
-        "uris": uris,
-        "offset": {
-            "position": start_index
-        }
-    });
-
-    if let Err(error) = TOKIO_RUNTIME.block_on(execute_spotify_request(
-        Method::PUT,
-        "me/player/play",
-        token,
-        query,
-        Some(body),
-    )) {
-        let message = if error.contains("HTTP 404") {
-            "No active Spotify device found. Open Spotify on a device and retry.".to_string()
-        } else {
-            error
-        };
-        return error_response("spotify_start_queue_failed", message);
+    // Start decoding + playing audio directly via rodio — no Spotify Connect device needed.
+    if let Err(error) =
+        TOKIO_RUNTIME.block_on(PLAYER.start_queue(&normalized_track_ids, start_index))
+    {
+        return error_response("librespot_start_queue_failed", error.message);
     }
 
     let mut state = match lock_state() {
         Ok(state) => state,
         Err(error) => return error_response("bridge_state_error", error),
     };
-    state.playback_access_token = Some(token.to_string());
+    // Persist the token so later transport commands can reconnect transparently.
+    state.playback_access_token = Some(token_owned);
     state.playback_queue = normalized_track_ids;
     state.playback_index = start_index;
-    state.playback_is_playing = true;
-    state.playback_progress_ms = 0;
-    state.playback_current_track_id = state.playback_queue.get(start_index).cloned();
 
     success_response(json!({
         "started": true,
-        "device_id": resolved_device_id,
         "track_count": state.playback_queue.len(),
         "start_index": state.playback_index
     }))
 }
 
-fn handle_spotify_play() -> String {
-    let token = match require_playback_token() {
-        Ok(token) => token,
-        Err(error) => return error_response("spotify_playback_token_missing", error),
+/// Ensures the librespot player is connected, reconnecting from the stored token
+/// if necessary. Also re-queues the stored track list after reconnect so that
+/// transport commands (play, seek, etc.) have a loaded track to act on.
+/// Returns an error string if the connection cannot be established.
+fn ensure_player_connected() -> Result<(), String> {
+    if TOKIO_RUNTIME.block_on(PLAYER.is_connected()) {
+        return Ok(());
+    }
+
+    let (token, client_id, queue, index) = {
+        let state = lock_state().map_err(|e| e)?;
+        let token = state
+            .playback_access_token
+            .clone()
+            .ok_or_else(|| "librespot_not_connected: No stored access token — call startQueue first".to_string())?;
+        let client_id = state
+            .client_id
+            .clone()
+            .ok_or_else(|| "librespot_not_connected: client_id not set — call init() first".to_string())?;
+        (token, client_id, state.playback_queue.clone(), state.playback_index)
     };
 
-    if let Err(error) = TOKIO_RUNTIME.block_on(execute_spotify_request(
-        Method::PUT,
-        "me/player/play",
-        &token,
-        Vec::new(),
-        Some(json!({})),
-    )) {
-        return error_response("spotify_playback_command_failed", error);
+    TOKIO_RUNTIME
+        .block_on(PLAYER.connect(&token, &client_id))
+        .map_err(|e| e.message)?;
+
+    // Restore the last-known track so subsequent play/seek/pause work.
+    if !queue.is_empty() {
+        TOKIO_RUNTIME
+            .block_on(PLAYER.start_queue(&queue, index))
+            .map_err(|e| e.message)?;
     }
 
-    if let Ok(mut state) = lock_state() {
-        state.playback_is_playing = true;
-    }
+    Ok(())
+}
 
-    success_response(json!({ "playing": true }))
+fn handle_spotify_play() -> String {
+    if let Err(msg) = ensure_player_connected() {
+        return error_response("spotify_playback_command_failed", msg);
+    }
+    match TOKIO_RUNTIME.block_on(PLAYER.play()) {
+        Ok(()) => success_response(json!({ "playing": true })),
+        Err(error) => error_response("spotify_playback_command_failed", error.message),
+    }
 }
 
 fn handle_spotify_pause() -> String {
-    let token = match require_playback_token() {
-        Ok(token) => token,
-        Err(error) => return error_response("spotify_playback_token_missing", error),
-    };
-
-    if let Err(error) = TOKIO_RUNTIME.block_on(execute_spotify_request(
-        Method::PUT,
-        "me/player/pause",
-        &token,
-        Vec::new(),
-        Some(json!({})),
-    )) {
-        return error_response("spotify_playback_command_failed", error);
+    if let Err(msg) = ensure_player_connected() {
+        return error_response("spotify_playback_command_failed", msg);
     }
-
-    if let Ok(mut state) = lock_state() {
-        state.playback_is_playing = false;
+    match TOKIO_RUNTIME.block_on(PLAYER.pause()) {
+        Ok(()) => success_response(json!({ "playing": false })),
+        Err(error) => error_response("spotify_playback_command_failed", error.message),
     }
-
-    success_response(json!({ "playing": false }))
 }
 
 fn handle_spotify_next() -> String {
-    let token = match require_playback_token() {
-        Ok(token) => token,
-        Err(error) => return error_response("spotify_playback_token_missing", error),
+    let mut state = match lock_state() {
+        Ok(state) => state,
+        Err(error) => return error_response("bridge_state_error", error),
     };
 
-    if let Err(error) = TOKIO_RUNTIME.block_on(execute_spotify_request(
-        Method::POST,
-        "me/player/next",
-        &token,
-        Vec::new(),
-        None,
-    )) {
-        return error_response("spotify_playback_command_failed", error);
+    if state.playback_queue.is_empty() {
+        return error_response("librespot_empty_queue", "No playback queue loaded");
     }
 
-    if let Ok(mut state) = lock_state() {
-        if !state.playback_queue.is_empty() {
-            if state.playback_index + 1 < state.playback_queue.len() {
-                state.playback_index += 1;
-            } else if state.playback_repeat_mode == RepeatModeState::All {
-                state.playback_index = 0;
-            }
-            state.playback_current_track_id =
-                state.playback_queue.get(state.playback_index).cloned();
-            state.playback_progress_ms = 0;
-        }
-        state.playback_is_playing = true;
+    let next_index = if state.playback_repeat_mode == RepeatModeState::One {
+        // Replay the current track.
+        state.playback_index
+    } else if state.playback_index + 1 < state.playback_queue.len() {
+        state.playback_index + 1
+    } else if state.playback_repeat_mode == RepeatModeState::All {
+        0
+    } else {
+        return success_response(json!({ "ok": true, "end_of_queue": true }));
+    };
+
+    let track_ids = state.playback_queue.clone();
+    state.playback_index = next_index;
+    drop(state);
+
+    if let Err(msg) = ensure_player_connected() {
+        return error_response("spotify_playback_command_failed", msg);
+    }
+    if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.start_queue(&track_ids, next_index)) {
+        return error_response("librespot_next_failed", error.message);
     }
 
     success_response(json!({ "ok": true }))
 }
 
 fn handle_spotify_previous() -> String {
-    let token = match require_playback_token() {
-        Ok(token) => token,
-        Err(error) => return error_response("spotify_playback_token_missing", error),
+    let mut state = match lock_state() {
+        Ok(state) => state,
+        Err(error) => return error_response("bridge_state_error", error),
     };
 
-    if let Err(error) = TOKIO_RUNTIME.block_on(execute_spotify_request(
-        Method::POST,
-        "me/player/previous",
-        &token,
-        Vec::new(),
-        None,
-    )) {
-        return error_response("spotify_playback_command_failed", error);
+    if state.playback_queue.is_empty() {
+        return error_response("librespot_empty_queue", "No playback queue loaded");
     }
 
-    if let Ok(mut state) = lock_state() {
-        if !state.playback_queue.is_empty() {
-            if state.playback_index > 0 {
-                state.playback_index -= 1;
-            } else if state.playback_repeat_mode == RepeatModeState::All {
-                state.playback_index = state.playback_queue.len().saturating_sub(1);
-            }
-            state.playback_current_track_id =
-                state.playback_queue.get(state.playback_index).cloned();
-            state.playback_progress_ms = 0;
-        }
-        state.playback_is_playing = true;
+    let prev_index = if state.playback_index > 0 {
+        state.playback_index - 1
+    } else if state.playback_repeat_mode == RepeatModeState::All {
+        state.playback_queue.len() - 1
+    } else {
+        0
+    };
+
+    let track_ids = state.playback_queue.clone();
+    state.playback_index = prev_index;
+    drop(state);
+
+    if let Err(msg) = ensure_player_connected() {
+        return error_response("spotify_playback_command_failed", msg);
+    }
+    if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.start_queue(&track_ids, prev_index)) {
+        return error_response("librespot_previous_failed", error.message);
     }
 
     success_response(json!({ "ok": true }))
@@ -822,26 +659,13 @@ fn handle_spotify_seek(config_json: &str) -> String {
         Err(error) => return error_response("invalid_seek_payload", error),
     };
 
-    let token = match require_playback_token() {
-        Ok(token) => token,
-        Err(error) => return error_response("spotify_playback_token_missing", error),
-    };
-
-    if let Err(error) = TOKIO_RUNTIME.block_on(execute_spotify_request(
-        Method::PUT,
-        "me/player/seek",
-        &token,
-        vec![("position_ms".to_string(), payload.position_ms.to_string())],
-        Some(json!({})),
-    )) {
-        return error_response("spotify_playback_command_failed", error);
+    if let Err(msg) = ensure_player_connected() {
+        return error_response("spotify_playback_command_failed", msg);
     }
-
-    if let Ok(mut state) = lock_state() {
-        state.playback_progress_ms = payload.position_ms;
+    match TOKIO_RUNTIME.block_on(PLAYER.seek(payload.position_ms)) {
+        Ok(()) => success_response(json!({ "position_ms": payload.position_ms })),
+        Err(error) => error_response("spotify_playback_command_failed", error.message),
     }
-
-    success_response(json!({ "position_ms": payload.position_ms }))
 }
 
 fn handle_spotify_set_volume(config_json: &str) -> String {
@@ -851,26 +675,13 @@ fn handle_spotify_set_volume(config_json: &str) -> String {
     };
 
     let volume_percent = payload.volume_percent.clamp(0, 100) as u8;
-    let token = match require_playback_token() {
-        Ok(token) => token,
-        Err(error) => return error_response("spotify_playback_token_missing", error),
-    };
-
-    if let Err(error) = TOKIO_RUNTIME.block_on(execute_spotify_request(
-        Method::PUT,
-        "me/player/volume",
-        &token,
-        vec![("volume_percent".to_string(), volume_percent.to_string())],
-        Some(json!({})),
-    )) {
-        return error_response("spotify_playback_command_failed", error);
+    if let Err(msg) = ensure_player_connected() {
+        return error_response("spotify_playback_command_failed", msg);
     }
-
-    if let Ok(mut state) = lock_state() {
-        state.playback_volume_percent = volume_percent;
+    match TOKIO_RUNTIME.block_on(PLAYER.set_volume(volume_percent)) {
+        Ok(()) => success_response(json!({ "volume_percent": volume_percent })),
+        Err(error) => error_response("spotify_playback_command_failed", error.message),
     }
-
-    success_response(json!({ "volume_percent": volume_percent }))
 }
 
 fn handle_spotify_set_shuffle(config_json: &str) -> String {
@@ -879,25 +690,12 @@ fn handle_spotify_set_shuffle(config_json: &str) -> String {
         Err(error) => return error_response("invalid_set_shuffle_payload", error),
     };
 
-    let token = match require_playback_token() {
-        Ok(token) => token,
-        Err(error) => return error_response("spotify_playback_token_missing", error),
-    };
-
-    if let Err(error) = TOKIO_RUNTIME.block_on(execute_spotify_request(
-        Method::PUT,
-        "me/player/shuffle",
-        &token,
-        vec![("state".to_string(), payload.enabled.to_string())],
-        Some(json!({})),
-    )) {
-        return error_response("spotify_playback_command_failed", error);
-    }
-
     if let Ok(mut state) = lock_state() {
         state.playback_shuffle = payload.enabled;
     }
 
+    // Shuffle is maintained in the queue manager (Kotlin side). Librespot itself
+    // does not expose a shuffle API; the queue order is controlled by the caller.
     success_response(json!({ "shuffle_enabled": payload.enabled }))
 }
 
@@ -918,118 +716,32 @@ fn handle_spotify_set_repeat_mode(config_json: &str) -> String {
         }
     };
 
-    let token = match require_playback_token() {
-        Ok(token) => token,
-        Err(error) => return error_response("spotify_playback_token_missing", error),
-    };
-
-    if let Err(error) = TOKIO_RUNTIME.block_on(execute_spotify_request(
-        Method::PUT,
-        "me/player/repeat",
-        &token,
-        vec![("state".to_string(), mode.as_spotify_api_state().to_string())],
-        Some(json!({})),
-    )) {
-        return error_response("spotify_playback_command_failed", error);
-    }
-
     if let Ok(mut state) = lock_state() {
         state.playback_repeat_mode = mode;
     }
 
+    // Repeat mode is tracked here and passed back to Kotlin to govern queue wrap-around.
     success_response(json!({ "repeat_mode": mode.as_snapshot_str() }))
 }
 
 fn handle_spotify_snapshot() -> String {
-    let token = match require_playback_token() {
-        Ok(token) => token,
-        Err(error) => return error_response("spotify_playback_token_missing", error),
+    let snapshot = TOKIO_RUNTIME.block_on(PLAYER.snapshot());
+    let state = match lock_state() {
+        Ok(state) => state,
+        Err(error) => return error_response("bridge_state_error", error),
     };
-
-    let request_result = TOKIO_RUNTIME.block_on(execute_spotify_request(
-        Method::GET,
-        "me/player",
-        &token,
-        Vec::new(),
-        None,
-    ));
-
-    match request_result {
-        Ok(Some(payload)) => {
-            let is_playing = payload
-                .get("is_playing")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let progress_ms = payload
-                .get("progress_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let volume_percent = payload
-                .get("device")
-                .and_then(|device| device.get("volume_percent"))
-                .and_then(Value::as_u64)
-                .unwrap_or(100)
-                .min(100) as u8;
-            let shuffle_enabled = payload
-                .get("shuffle_state")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let repeat_mode = RepeatModeState::from_spotify_api(
-                payload
-                    .get("repeat_state")
-                    .and_then(Value::as_str)
-                    .unwrap_or("off"),
-            );
-            let current_track_id = payload
-                .get("item")
-                .and_then(|item| item.get("id"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
-
-            if let Ok(mut state) = lock_state() {
-                state.playback_is_playing = is_playing;
-                state.playback_progress_ms = progress_ms;
-                state.playback_volume_percent = volume_percent;
-                state.playback_shuffle = shuffle_enabled;
-                state.playback_repeat_mode = repeat_mode;
-                state.playback_current_track_id = current_track_id.clone();
-
-                if let Some(track_id) = current_track_id.as_ref()
-                    && let Some(index) = state
-                        .playback_queue
-                        .iter()
-                        .position(|entry| entry == track_id)
-                {
-                    state.playback_index = index;
-                }
-            }
-
-            success_response(json!({
-                "is_playing": is_playing,
-                "progress_ms": progress_ms,
-                "volume_percent": volume_percent,
-                "shuffle_enabled": shuffle_enabled,
-                "repeat_mode": repeat_mode.as_snapshot_str(),
-                "current_track_id": current_track_id
-            }))
-        }
-        Ok(None) => {
-            let state = match lock_state() {
-                Ok(state) => state,
-                Err(error) => return error_response("bridge_state_error", error),
-            };
-
-            success_response(json!({
-                "is_playing": state.playback_is_playing,
-                "progress_ms": state.playback_progress_ms,
-                "volume_percent": state.playback_volume_percent,
-                "shuffle_enabled": state.playback_shuffle,
-                "repeat_mode": state.playback_repeat_mode.as_snapshot_str(),
-                "current_track_id": state.playback_current_track_id
-            }))
-        }
-        Err(error) => error_response("spotify_playback_state_failed", error),
-    }
+    let current_track_id = snapshot
+        .current_track_id
+        .or_else(|| state.playback_queue.get(state.playback_index).cloned());
+    success_response(json!({
+        "is_playing": snapshot.is_playing,
+        "progress_ms": snapshot.progress_ms,
+        "end_of_track": snapshot.end_of_track,
+        "volume_percent": snapshot.volume_percent,
+        "shuffle_enabled": state.playback_shuffle,
+        "repeat_mode": state.playback_repeat_mode.as_snapshot_str(),
+        "current_track_id": current_track_id
+    }))
 }
 
 fn into_jstring(env: &mut JNIEnv<'_>, payload: String) -> jstring {
@@ -1048,6 +760,106 @@ fn read_jstring(
         .map(|value| value.into())
         .map_err(|error| format!("Failed to read {} argument: {}", argument_name, error))
 }
+
+/// Called by the Android runtime as soon as `libany_player_ffi_android.so` is
+/// loaded. We use it to wire up `android_logger` so that all `log::*` calls
+/// Called by the JVM when our shared library is first loaded.
+///
+/// 1. Initialises the `android_logger` backend so Rust `log::*` calls are
+///    visible in logcat under the tag `any_player_rust`.
+/// 2. Registers the Android JavaVM + Application-context pointer with
+///    `ndk_context` so that cpal/AAudio can open audio streams without
+///    hitting the "android context was not initialized" panic.
+#[unsafe(no_mangle)]
+pub extern "system" fn JNI_OnLoad(
+    vm: *mut jni::sys::JavaVM,
+    _reserved: *mut std::ffi::c_void,
+) -> jni::sys::jint {
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_tag("any_player_rust")
+            .with_max_level(log::LevelFilter::Debug),
+    );
+    log::info!("any_player_rust JNI_OnLoad: logger initialised");
+
+    // Initialise ndk-context so that cpal's AAudio backend can obtain the
+    // Android AudioManager via JNI.  We do this by calling into Java to
+    // retrieve the current Application context and storing the pair
+    // (JavaVM*, jobject context) as a global reference.
+    //
+    // Safety: `vm` is valid for the lifetime of the process; the global JNI
+    // reference to the context is kept alive indefinitely (intentional — we
+    // need it for the lifetime of the player).
+    unsafe {
+        match init_ndk_context(vm) {
+            Ok(()) => log::info!("any_player_rust JNI_OnLoad: ndk-context initialised"),
+            Err(e) => log::error!(
+                "any_player_rust JNI_OnLoad: failed to initialise ndk-context: {}. \
+                 Audio playback may not work.",
+                e
+            ),
+        }
+    }
+
+    jni::sys::JNI_VERSION_1_6
+}
+
+/// Retrieves the Android Application context via reflection and stores it in
+/// `ndk_context` so that cpal's AAudio host can use it.
+///
+/// # Safety
+/// `vm` must be a valid, non-null `JavaVM*` pointer for the lifetime of the
+/// process.
+unsafe fn init_ndk_context(vm: *mut jni::sys::JavaVM) -> Result<(), String> {
+    use jni::{JNIEnv, JavaVM};
+
+    let jvm = unsafe { JavaVM::from_raw(vm) }
+        .map_err(|e| format!("JavaVM::from_raw: {e}"))?;
+
+    let mut guard = jvm
+        .attach_current_thread()
+        .map_err(|e| format!("attach_current_thread: {e}"))?;
+    let env: &mut JNIEnv<'_> = &mut guard;
+
+    // ActivityThread.currentApplication() is a static method that returns the
+    // global Application singleton — it's available from any thread, even
+    // before any Activity is started.
+    let activity_thread = env
+        .find_class("android/app/ActivityThread")
+        .map_err(|e| format!("find_class ActivityThread: {e}"))?;
+
+    let app_obj = env
+        .call_static_method(
+            activity_thread,
+            "currentApplication",
+            "()Landroid/app/Application;",
+            &[],
+        )
+        .map_err(|e| format!("call currentApplication: {e}"))?
+        .l()
+        .map_err(|e| format!("result as object: {e}"))?;
+
+    if app_obj.is_null() {
+        return Err("currentApplication() returned null".to_string());
+    }
+
+    // Promote to a global JNI reference so the object is not collected.
+    let global_app = env
+        .new_global_ref(app_obj)
+        .map_err(|e| format!("new_global_ref: {e}"))?;
+
+    // Leak the global ref intentionally — we need it for the process lifetime.
+    let ctx_ptr = global_app.as_raw() as *mut std::ffi::c_void;
+    std::mem::forget(global_app);
+
+    // Safety: both `vm` and `ctx_ptr` are valid for the process lifetime.
+    unsafe {
+        ndk_context::initialize_android_context(vm as *mut std::ffi::c_void, ctx_ptr);
+    }
+
+    Ok(())
+}
+
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_init(
@@ -1298,19 +1110,13 @@ mod tests {
     }
 
     #[test]
-    fn spotify_snapshot_requires_playback_token() {
+    fn spotify_snapshot_returns_idle_state_when_not_playing() {
         let _guard = TEST_MUTEX.lock().expect("test mutex");
 
-        {
-            let mut state = BRIDGE_STATE.lock().expect("state lock");
-            state.playback_access_token = None;
-        }
-
+        // Without a librespot connection the snapshot should return a valid
+        // ok response with is_playing=false (the player default).
         let payload = parse_json(&handle_spotify_snapshot());
-        assert_eq!(payload["ok"], Value::Bool(false));
-        assert_eq!(
-            payload["error"]["code"],
-            Value::String("spotify_playback_token_missing".to_string())
-        );
+        assert_eq!(payload["ok"], Value::Bool(true));
+        assert_eq!(payload["data"]["is_playing"], Value::Bool(false));
     }
 }
