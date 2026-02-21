@@ -129,8 +129,10 @@ impl LibrespotPlayer {
             )
         })?;
 
-        let mut mixer_config = MixerConfig::default();
-        mixer_config.volume_ctrl = VolumeCtrl::Linear;
+        let mixer_config = MixerConfig {
+            volume_ctrl: VolumeCtrl::Linear,
+            ..Default::default()
+        };
         let mixer = mixer::find(None).ok_or_else(|| {
             SpotifyEngineError::new("librespot_mixer_not_found", "No audio mixer available")
         })?(mixer_config)

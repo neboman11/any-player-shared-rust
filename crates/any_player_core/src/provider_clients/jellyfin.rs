@@ -1,7 +1,7 @@
+use super::required_session_param;
 use crate::models::{Playlist, Source, Track};
 use crate::provider_api::{ProviderApi, ProviderConnectionCheck};
 use crate::providers::{ProviderAuthRequest, ProviderError};
-use super::required_session_param;
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client, RequestBuilder};
