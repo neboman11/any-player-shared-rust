@@ -1,12 +1,9 @@
 use librespot_core::{
-    authentication::Credentials,
-    config::SessionConfig,
-    session::Session,
-    spotify_uri::SpotifyUri,
+    authentication::Credentials, config::SessionConfig, session::Session, spotify_uri::SpotifyUri,
 };
 use librespot_playback::{
     audio_backend,
-    config::{AudioFormat, PlayerConfig},
+    config::{AudioFormat, PlayerConfig, VolumeCtrl},
     mixer::{self, Mixer, MixerConfig},
     player::{Player, PlayerEvent},
 };
@@ -132,13 +129,12 @@ impl LibrespotPlayer {
             )
         })?;
 
-        let mixer_config = MixerConfig::default();
-        let mixer = mixer::find(None)
-            .ok_or_else(|| {
-                SpotifyEngineError::new("librespot_mixer_not_found", "No audio mixer available")
-            })?
-            (mixer_config)
-            .map_err(|e| SpotifyEngineError::new("librespot_mixer_init_failed", e.to_string()))?;
+        let mut mixer_config = MixerConfig::default();
+        mixer_config.volume_ctrl = VolumeCtrl::Linear;
+        let mixer = mixer::find(None).ok_or_else(|| {
+            SpotifyEngineError::new("librespot_mixer_not_found", "No audio mixer available")
+        })?(mixer_config)
+        .map_err(|e| SpotifyEngineError::new("librespot_mixer_init_failed", e.to_string()))?;
 
         let player = Player::new(
             player_config,
@@ -199,7 +195,11 @@ impl LibrespotPlayer {
         tokio::spawn(async move {
             while let Some(event) = event_channel.recv().await {
                 match event {
-                    PlayerEvent::Playing { position_ms, track_id, .. } => {
+                    PlayerEvent::Playing {
+                        position_ms,
+                        track_id,
+                        ..
+                    } => {
                         log::info!("librespot: playing track={} at {}ms", track_id, position_ms);
                         if let Ok(mut s) = stats_ref.lock() {
                             s.is_playing = true;
@@ -209,7 +209,11 @@ impl LibrespotPlayer {
                             s.play_started_at = Some(std::time::Instant::now());
                         }
                     }
-                    PlayerEvent::Paused { position_ms, track_id, .. } => {
+                    PlayerEvent::Paused {
+                        position_ms,
+                        track_id,
+                        ..
+                    } => {
                         log::info!("librespot: paused track={} at {}ms", track_id, position_ms);
                         if let Ok(mut s) = stats_ref.lock() {
                             s.is_playing = false;
@@ -224,7 +228,11 @@ impl LibrespotPlayer {
                             s.play_started_at = None;
                         }
                     }
-                    PlayerEvent::Loading { track_id, position_ms, .. } => {
+                    PlayerEvent::Loading {
+                        track_id,
+                        position_ms,
+                        ..
+                    } => {
                         log::info!("librespot: loading track={} at {}ms", track_id, position_ms);
                         if let Ok(mut s) = stats_ref.lock() {
                             s.progress_ms = position_ms as u64;
@@ -395,7 +403,12 @@ impl LibrespotPlayer {
                         // Consume the end_of_track flag so callers see it exactly once.
                         let end_of_track = s.end_of_track;
                         s.end_of_track = false;
-                        (s.is_playing, live_ms, end_of_track, s.current_track_id.clone())
+                        (
+                            s.is_playing,
+                            live_ms,
+                            end_of_track,
+                            s.current_track_id.clone(),
+                        )
                     })
                     .unwrap_or_default();
                 PlayerSnapshot {
@@ -441,4 +454,3 @@ fn not_connected_error() -> SpotifyEngineError {
         "Player is not connected. Call connect() first.",
     )
 }
-

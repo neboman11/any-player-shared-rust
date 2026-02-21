@@ -1,6 +1,7 @@
 use crate::models::{Playlist, Source, Track};
 use crate::provider_api::{ProviderApi, ProviderConnectionCheck};
 use crate::providers::{ProviderAuthRequest, ProviderError};
+use super::required_session_param;
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client, RequestBuilder};
@@ -105,24 +106,13 @@ impl JellyfinApiClient {
         Self { client }
     }
 
-    fn required_param<'a>(
-        session: &'a ProviderAuthRequest,
-        key: &'static str,
-    ) -> Result<&'a str, ProviderError> {
-        session
-            .get(key)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| ProviderError(format!("Missing Jellyfin {}", key)))
-    }
-
     fn base_url(session: &ProviderAuthRequest) -> Result<String, ProviderError> {
-        let raw_url = Self::required_param(session, "url")?;
+        let raw_url = required_session_param(session, "Jellyfin", "url")?;
         Ok(raw_url.trim_end_matches('/').to_string())
     }
 
     fn api_key(session: &ProviderAuthRequest) -> Result<&str, ProviderError> {
-        Self::required_param(session, "api_key")
+        required_session_param(session, "Jellyfin", "api_key")
     }
 
     fn build_headers(api_key: &str) -> Result<HeaderMap, ProviderError> {

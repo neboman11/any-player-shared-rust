@@ -1,6 +1,6 @@
 use any_player_spotify_engine::{
-    LibrespotPlayer, SpotifyEngineError, SpotifySessionBackend,
-    SpotifySessionConfig, SpotifySessionEngine, SpotifyToken,
+    LibrespotPlayer, SpotifyEngineError, SpotifySessionBackend, SpotifySessionConfig,
+    SpotifySessionEngine, SpotifyToken,
 };
 use async_trait::async_trait;
 use jni::JNIEnv;
@@ -253,7 +253,11 @@ fn normalize_spotify_track_id(raw: &str) -> Option<String> {
         trimmed
     };
     let id = id.trim();
-    if id.is_empty() { None } else { Some(id.to_string()) }
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
 }
 
 fn require_engine() -> Result<SharedEngine, String> {
@@ -492,7 +496,12 @@ fn handle_spotify_start_queue(config_json: &str) -> String {
         };
         match state.client_id.clone() {
             Some(id) => id,
-            None => return error_response("spotify_client_id_missing", "client_id not set — call init() first"),
+            None => {
+                return error_response(
+                    "spotify_client_id_missing",
+                    "client_id not set — call init() first",
+                );
+            }
         }
     };
 
@@ -540,16 +549,19 @@ fn ensure_player_connected() -> Result<(), String> {
     }
 
     let (token, client_id, queue, index) = {
-        let state = lock_state().map_err(|e| e)?;
-        let token = state
-            .playback_access_token
-            .clone()
-            .ok_or_else(|| "librespot_not_connected: No stored access token — call startQueue first".to_string())?;
-        let client_id = state
-            .client_id
-            .clone()
-            .ok_or_else(|| "librespot_not_connected: client_id not set — call init() first".to_string())?;
-        (token, client_id, state.playback_queue.clone(), state.playback_index)
+        let state = lock_state()?;
+        let token = state.playback_access_token.clone().ok_or_else(|| {
+            "librespot_not_connected: No stored access token — call startQueue first".to_string()
+        })?;
+        let client_id = state.client_id.clone().ok_or_else(|| {
+            "librespot_not_connected: client_id not set — call init() first".to_string()
+        })?;
+        (
+            token,
+            client_id,
+            state.playback_queue.clone(),
+            state.playback_index,
+        )
     };
 
     TOKIO_RUNTIME
@@ -566,24 +578,30 @@ fn ensure_player_connected() -> Result<(), String> {
     Ok(())
 }
 
-fn handle_spotify_play() -> String {
+fn run_connected_player_command<F>(success_payload: serde_json::Value, command: F) -> String
+where
+    F: FnOnce() -> Result<(), SpotifyEngineError>,
+{
     if let Err(msg) = ensure_player_connected() {
         return error_response("spotify_playback_command_failed", msg);
     }
-    match TOKIO_RUNTIME.block_on(PLAYER.play()) {
-        Ok(()) => success_response(json!({ "playing": true })),
+
+    match command() {
+        Ok(()) => success_response(success_payload),
         Err(error) => error_response("spotify_playback_command_failed", error.message),
     }
 }
 
+fn handle_spotify_play() -> String {
+    run_connected_player_command(json!({ "playing": true }), || {
+        TOKIO_RUNTIME.block_on(PLAYER.play())
+    })
+}
+
 fn handle_spotify_pause() -> String {
-    if let Err(msg) = ensure_player_connected() {
-        return error_response("spotify_playback_command_failed", msg);
-    }
-    match TOKIO_RUNTIME.block_on(PLAYER.pause()) {
-        Ok(()) => success_response(json!({ "playing": false })),
-        Err(error) => error_response("spotify_playback_command_failed", error.message),
-    }
+    run_connected_player_command(json!({ "playing": false }), || {
+        TOKIO_RUNTIME.block_on(PLAYER.pause())
+    })
 }
 
 fn handle_spotify_next() -> String {
@@ -659,13 +677,9 @@ fn handle_spotify_seek(config_json: &str) -> String {
         Err(error) => return error_response("invalid_seek_payload", error),
     };
 
-    if let Err(msg) = ensure_player_connected() {
-        return error_response("spotify_playback_command_failed", msg);
-    }
-    match TOKIO_RUNTIME.block_on(PLAYER.seek(payload.position_ms)) {
-        Ok(()) => success_response(json!({ "position_ms": payload.position_ms })),
-        Err(error) => error_response("spotify_playback_command_failed", error.message),
-    }
+    run_connected_player_command(json!({ "position_ms": payload.position_ms }), || {
+        TOKIO_RUNTIME.block_on(PLAYER.seek(payload.position_ms))
+    })
 }
 
 fn handle_spotify_set_volume(config_json: &str) -> String {
@@ -675,13 +689,9 @@ fn handle_spotify_set_volume(config_json: &str) -> String {
     };
 
     let volume_percent = payload.volume_percent.clamp(0, 100) as u8;
-    if let Err(msg) = ensure_player_connected() {
-        return error_response("spotify_playback_command_failed", msg);
-    }
-    match TOKIO_RUNTIME.block_on(PLAYER.set_volume(volume_percent)) {
-        Ok(()) => success_response(json!({ "volume_percent": volume_percent })),
-        Err(error) => error_response("spotify_playback_command_failed", error.message),
-    }
+    run_connected_player_command(json!({ "volume_percent": volume_percent }), || {
+        TOKIO_RUNTIME.block_on(PLAYER.set_volume(volume_percent))
+    })
 }
 
 fn handle_spotify_set_shuffle(config_json: &str) -> String {
@@ -770,8 +780,13 @@ fn read_jstring(
 /// 2. Registers the Android JavaVM + Application-context pointer with
 ///    `ndk_context` so that cpal/AAudio can open audio streams without
 ///    hitting the "android context was not initialized" panic.
+///
+/// # Safety
+/// The JVM must invoke this function with a valid, non-null `JavaVM*` that
+/// remains valid for the lifetime of the process, as guaranteed by the JNI
+/// specification for `JNI_OnLoad`.
 #[unsafe(no_mangle)]
-pub extern "system" fn JNI_OnLoad(
+pub unsafe extern "system" fn JNI_OnLoad(
     vm: *mut jni::sys::JavaVM,
     _reserved: *mut std::ffi::c_void,
 ) -> jni::sys::jint {
@@ -813,8 +828,7 @@ pub extern "system" fn JNI_OnLoad(
 unsafe fn init_ndk_context(vm: *mut jni::sys::JavaVM) -> Result<(), String> {
     use jni::{JNIEnv, JavaVM};
 
-    let jvm = unsafe { JavaVM::from_raw(vm) }
-        .map_err(|e| format!("JavaVM::from_raw: {e}"))?;
+    let jvm = unsafe { JavaVM::from_raw(vm) }.map_err(|e| format!("JavaVM::from_raw: {e}"))?;
 
     let mut guard = jvm
         .attach_current_thread()
@@ -859,7 +873,6 @@ unsafe fn init_ndk_context(vm: *mut jni::sys::JavaVM) -> Result<(), String> {
 
     Ok(())
 }
-
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_init(

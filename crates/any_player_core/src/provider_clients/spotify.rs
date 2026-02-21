@@ -1,3 +1,4 @@
+use super::required_session_param;
 use crate::models::{Playlist, Source, Track};
 use crate::provider_api::{ProviderApi, ProviderConnectionCheck};
 use crate::providers::{ProviderAuthRequest, ProviderError};
@@ -29,19 +30,8 @@ impl SpotifyApiClient {
         Self { client }
     }
 
-    fn required_param<'a>(
-        session: &'a ProviderAuthRequest,
-        key: &'static str,
-    ) -> Result<&'a str, ProviderError> {
-        session
-            .get(key)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| ProviderError(format!("Missing Spotify {}", key)))
-    }
-
     fn require_access_token(session: &ProviderAuthRequest) -> Result<&str, ProviderError> {
-        Self::required_param(session, "access_token")
+        required_session_param(session, "Spotify", "access_token")
     }
 
     fn normalize_track_id(track_id: &str) -> String {

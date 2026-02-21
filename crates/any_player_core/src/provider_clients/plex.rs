@@ -1,6 +1,7 @@
 use crate::models::{Playlist, Source, Track};
 use crate::provider_api::{ProviderApi, ProviderConnectionCheck};
 use crate::providers::{ProviderAuthRequest, ProviderError};
+use super::required_session_param;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
@@ -82,24 +83,13 @@ impl PlexApiClient {
         Self { client }
     }
 
-    fn required_param<'a>(
-        session: &'a ProviderAuthRequest,
-        key: &'static str,
-    ) -> Result<&'a str, ProviderError> {
-        session
-            .get(key)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| ProviderError(format!("Missing Plex {}", key)))
-    }
-
     fn session_base_url(session: &ProviderAuthRequest) -> Result<String, ProviderError> {
-        let url = Self::required_param(session, "url")?;
+        let url = required_session_param(session, "Plex", "url")?;
         Ok(url.trim_end_matches('/').to_string())
     }
 
     fn session_token(session: &ProviderAuthRequest) -> Result<&str, ProviderError> {
-        Self::required_param(session, "token")
+        required_session_param(session, "Plex", "token")
     }
 
     fn authed_url(base_url: &str, token: &str, path_with_query: &str) -> String {
