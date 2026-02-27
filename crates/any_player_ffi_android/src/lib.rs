@@ -604,7 +604,9 @@ fn handle_spotify_start_queue(config_json: &str) -> String {
     }
 
     // Start decoding + playing audio directly via rodio — no Spotify Connect device needed.
-    if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.start_queue(&normalized_track_ids, start_index)) {
+    if let Err(error) =
+        TOKIO_RUNTIME.block_on(PLAYER.start_queue(&normalized_track_ids, start_index))
+    {
         return error_response("librespot_start_queue_failed", error.message);
     }
 
@@ -830,11 +832,13 @@ fn handle_get_audio_normalization_settings() -> String {
 }
 
 fn handle_set_audio_normalization_settings(config_json: &str) -> String {
-    let payload =
-        match parse_required_json::<AudioNormalizationSettingsPayload>(config_json, "set_audio_normalization_settings") {
-            Ok(payload) => payload,
-            Err(error) => return error_response("invalid_audio_normalization_payload", error),
-        };
+    let payload = match parse_required_json::<AudioNormalizationSettingsPayload>(
+        config_json,
+        "set_audio_normalization_settings",
+    ) {
+        Ok(payload) => payload,
+        Err(error) => return error_response("invalid_audio_normalization_payload", error),
+    };
 
     let (requested_volume_percent, output_volume_percent) = {
         let mut state = match lock_state() {
@@ -855,10 +859,10 @@ fn handle_set_audio_normalization_settings(config_json: &str) -> String {
         (state.playback_volume_percent, output)
     };
 
-    if TOKIO_RUNTIME.block_on(PLAYER.is_connected()) {
-        if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.set_volume(output_volume_percent)) {
-            return error_response("librespot_set_volume_failed", error.message);
-        }
+    if TOKIO_RUNTIME.block_on(PLAYER.is_connected())
+        && let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.set_volume(output_volume_percent))
+    {
+        return error_response("librespot_set_volume_failed", error.message);
     }
 
     success_response(json!({
@@ -972,14 +976,16 @@ fn require_field(value: Option<String>, field: &str) -> Result<String, String> {
 }
 
 fn json_value<T: serde::Serialize>(value: T) -> Result<Value, String> {
-    serde_json::to_value(value).map_err(|error| format!("Failed to encode provider response: {}", error))
+    serde_json::to_value(value)
+        .map_err(|error| format!("Failed to encode provider response: {}", error))
 }
 
 fn handle_provider_api_call(config_json: &str) -> String {
-    let payload = match parse_required_json::<ProviderApiCallPayload>(config_json, "provider_api_call") {
-        Ok(payload) => payload,
-        Err(error) => return error_response("invalid_provider_api_payload", error),
-    };
+    let payload =
+        match parse_required_json::<ProviderApiCallPayload>(config_json, "provider_api_call") {
+            Ok(payload) => payload,
+            Err(error) => return error_response("invalid_provider_api_payload", error),
+        };
 
     let source = payload.source.trim().to_ascii_lowercase();
     let operation = payload.operation.trim().to_ascii_lowercase();

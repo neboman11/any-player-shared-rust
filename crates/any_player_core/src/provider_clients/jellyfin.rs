@@ -310,10 +310,7 @@ impl JellyfinApiClient {
     }
 
     fn item_to_playlist(base_url: &str, api_key: &str, item: &JellyfinItem) -> Playlist {
-        let track_count = item
-            .child_count
-            .or(item.recursive_item_count)
-            .unwrap_or(0) as usize;
+        let track_count = item.child_count.or(item.recursive_item_count).unwrap_or(0) as usize;
 
         Playlist {
             id: item.id.clone(),

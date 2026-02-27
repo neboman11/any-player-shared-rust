@@ -143,8 +143,8 @@ pub fn effective_output_volume(
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_output_volume, normalization_target_runtime_factor, AdaptiveNormalizationState,
-        AudioNormalizationSettings, AudioNormalizationSource,
+        AdaptiveNormalizationState, AudioNormalizationSettings, AudioNormalizationSource,
+        effective_output_volume, normalization_target_runtime_factor,
     };
 
     #[test]
