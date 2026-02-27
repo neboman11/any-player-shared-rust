@@ -7,6 +7,7 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+any_player_core = { path = "../any_player_core" }
 any_player_spotify_engine = { path = "../any_player_spotify_engine" }
 async-trait = "0.1"
 android_logger = "0.14"

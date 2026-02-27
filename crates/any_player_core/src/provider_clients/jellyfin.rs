@@ -48,6 +48,8 @@ struct JellyfinItem {
     album_primary_image_tag: Option<String>,
     #[serde(rename = "ChildCount")]
     child_count: Option<u32>,
+    #[serde(rename = "RecursiveItemCount")]
+    recursive_item_count: Option<u32>,
     #[serde(rename = "Bitrate")]
     #[serde(alias = "BitRate")]
     bitrate: Option<u32>,
@@ -308,13 +310,15 @@ impl JellyfinApiClient {
     }
 
     fn item_to_playlist(base_url: &str, api_key: &str, item: &JellyfinItem) -> Playlist {
+        let track_count = item.child_count.or(item.recursive_item_count).unwrap_or(0) as usize;
+
         Playlist {
             id: item.id.clone(),
             name: item.name.clone(),
             description: None,
             owner: "Jellyfin".to_string(),
             image_url: Self::get_image_url(base_url, api_key, item),
-            track_count: item.child_count.unwrap_or(0) as usize,
+            track_count,
             tracks: Vec::new(),
             source: Source::Jellyfin,
         }

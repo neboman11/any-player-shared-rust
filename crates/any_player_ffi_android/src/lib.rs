@@ -1,3 +1,11 @@
+use any_player_core::audio_normalization::{
+    AdaptiveNormalizationState, AudioNormalizationSettings, AudioNormalizationSource,
+    INTERNAL_NORMALIZATION_TARGET, effective_output_volume,
+};
+use any_player_core::provider_api::ProviderApi;
+use any_player_core::provider_api::ProviderConnectionCheck;
+use any_player_core::provider_clients::{jellyfin::JellyfinApiClient, plex::PlexApiClient};
+use any_player_core::providers::ProviderAuthRequest;
 use any_player_spotify_engine::{
     LibrespotPlayer, SpotifyEngineError, SpotifySessionBackend, SpotifySessionConfig,
     SpotifySessionEngine, SpotifyToken,
@@ -9,6 +17,7 @@ use jni::sys::jstring;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Builder, Runtime};
@@ -52,8 +61,11 @@ struct BridgeState {
     // Local playback state mirrored for snapshot responses.
     playback_queue: Vec<String>,
     playback_index: usize,
+    playback_volume_percent: u8,
     playback_shuffle: bool,
     playback_repeat_mode: RepeatModeState,
+    audio_normalization: AudioNormalizationSettings,
+    adaptive_normalization: AdaptiveNormalizationState,
 }
 
 impl Default for BridgeState {
@@ -64,8 +76,15 @@ impl Default for BridgeState {
             playback_access_token: None,
             playback_queue: Vec::new(),
             playback_index: 0,
+            playback_volume_percent: 100,
             playback_shuffle: false,
             playback_repeat_mode: RepeatModeState::Off,
+            audio_normalization: AudioNormalizationSettings {
+                enabled: false,
+                target: INTERNAL_NORMALIZATION_TARGET,
+                strict_mode: false,
+            },
+            adaptive_normalization: AdaptiveNormalizationState::default(),
         }
     }
 }
@@ -170,6 +189,35 @@ struct RepeatModePayload {
     mode: String,
 }
 
+#[derive(Deserialize)]
+struct AudioNormalizationSettingsPayload {
+    enabled: bool,
+    #[serde(default)]
+    strict_mode: bool,
+}
+
+#[derive(Deserialize)]
+struct ApplyNormalizationPayload {
+    volume_percent: i32,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderApiCallPayload {
+    source: String,
+    operation: String,
+    session: HashMap<String, String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 fn current_epoch_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -200,6 +248,45 @@ fn lock_state() -> Result<std::sync::MutexGuard<'static, BridgeState>, String> {
     BRIDGE_STATE
         .lock()
         .map_err(|_| "Bridge state mutex poisoned".to_string())
+}
+
+fn parse_normalization_source(source: Option<&str>) -> AudioNormalizationSource {
+    match source
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "other".to_string())
+        .as_str()
+    {
+        "spotify" => AudioNormalizationSource::Spotify,
+        _ => AudioNormalizationSource::Other,
+    }
+}
+
+fn strict_gain_for_source(
+    settings: &AudioNormalizationSettings,
+    adaptive_state: &AdaptiveNormalizationState,
+    source: AudioNormalizationSource,
+) -> f32 {
+    if !settings.strict_mode {
+        return 1.0;
+    }
+
+    let source_key = match source {
+        AudioNormalizationSource::Spotify => "spotify",
+        AudioNormalizationSource::Other => "other",
+    };
+
+    adaptive_state.strict_compensation_gain(source_key)
+}
+
+fn normalized_volume_for_source(
+    base_volume_percent: i32,
+    source: AudioNormalizationSource,
+    settings: &AudioNormalizationSettings,
+    adaptive_state: &AdaptiveNormalizationState,
+) -> u8 {
+    let clamped_base = base_volume_percent.clamp(0, 100) as u32;
+    let strict_gain = strict_gain_for_source(settings, adaptive_state, source);
+    effective_output_volume(clamped_base, source, settings, strict_gain) as u8
 }
 
 fn parse_required_json<T>(raw_json: &str, field_name: &str) -> Result<T, String>
@@ -523,6 +610,23 @@ fn handle_spotify_start_queue(config_json: &str) -> String {
         return error_response("librespot_start_queue_failed", error.message);
     }
 
+    // Apply current effective output volume right after queue start.
+    let output_volume = {
+        let state = match lock_state() {
+            Ok(state) => state,
+            Err(error) => return error_response("bridge_state_error", error),
+        };
+        normalized_volume_for_source(
+            state.playback_volume_percent as i32,
+            AudioNormalizationSource::Spotify,
+            &state.audio_normalization,
+            &state.adaptive_normalization,
+        )
+    };
+    if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.set_volume(output_volume)) {
+        return error_response("librespot_set_volume_failed", error.message);
+    }
+
     let mut state = match lock_state() {
         Ok(state) => state,
         Err(error) => return error_response("bridge_state_error", error),
@@ -688,10 +792,126 @@ fn handle_spotify_set_volume(config_json: &str) -> String {
         Err(error) => return error_response("invalid_set_volume_payload", error),
     };
 
-    let volume_percent = payload.volume_percent.clamp(0, 100) as u8;
-    run_connected_player_command(json!({ "volume_percent": volume_percent }), || {
-        TOKIO_RUNTIME.block_on(PLAYER.set_volume(volume_percent))
-    })
+    let (requested_volume_percent, output_volume_percent) = {
+        let mut state = match lock_state() {
+            Ok(state) => state,
+            Err(error) => return error_response("bridge_state_error", error),
+        };
+
+        let requested = payload.volume_percent.clamp(0, 100) as u8;
+        let output = normalized_volume_for_source(
+            requested as i32,
+            AudioNormalizationSource::Spotify,
+            &state.audio_normalization,
+            &state.adaptive_normalization,
+        );
+        // Avoid division by zero when volume is 0 (gain stays near 1.0).
+        let gain = output as f32 / requested.max(1) as f32;
+        state.adaptive_normalization.push_gain("spotify", gain);
+        state.playback_volume_percent = requested;
+        (requested, output)
+    };
+
+    run_connected_player_command(
+        json!({
+            "volume_percent": requested_volume_percent,
+            "output_volume_percent": output_volume_percent
+        }),
+        || TOKIO_RUNTIME.block_on(PLAYER.set_volume(output_volume_percent)),
+    )
+}
+
+fn handle_get_audio_normalization_settings() -> String {
+    let state = match lock_state() {
+        Ok(state) => state,
+        Err(error) => return error_response("bridge_state_error", error),
+    };
+
+    success_response(json!({
+        "enabled": state.audio_normalization.enabled,
+        "strict_mode": state.audio_normalization.strict_mode,
+        "target": state.audio_normalization.target,
+    }))
+}
+
+fn handle_set_audio_normalization_settings(config_json: &str) -> String {
+    let payload = match parse_required_json::<AudioNormalizationSettingsPayload>(
+        config_json,
+        "set_audio_normalization_settings",
+    ) {
+        Ok(payload) => payload,
+        Err(error) => return error_response("invalid_audio_normalization_payload", error),
+    };
+
+    let (requested_volume_percent, output_volume_percent) = {
+        let mut state = match lock_state() {
+            Ok(state) => state,
+            Err(error) => return error_response("bridge_state_error", error),
+        };
+
+        state.audio_normalization.enabled = payload.enabled;
+        state.audio_normalization.strict_mode = payload.strict_mode;
+        state.audio_normalization.target = INTERNAL_NORMALIZATION_TARGET;
+
+        let output = normalized_volume_for_source(
+            state.playback_volume_percent as i32,
+            AudioNormalizationSource::Spotify,
+            &state.audio_normalization,
+            &state.adaptive_normalization,
+        );
+        (state.playback_volume_percent, output)
+    };
+
+    if TOKIO_RUNTIME.block_on(PLAYER.is_connected())
+        && let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.set_volume(output_volume_percent))
+    {
+        return error_response("librespot_set_volume_failed", error.message);
+    }
+
+    success_response(json!({
+        "enabled": payload.enabled,
+        "strict_mode": payload.strict_mode,
+        "target": INTERNAL_NORMALIZATION_TARGET,
+        "volume_percent": requested_volume_percent,
+        "output_volume_percent": output_volume_percent,
+    }))
+}
+
+fn handle_apply_audio_normalization_volume(config_json: &str) -> String {
+    let payload = match parse_required_json::<ApplyNormalizationPayload>(
+        config_json,
+        "apply_audio_normalization_volume",
+    ) {
+        Ok(payload) => payload,
+        Err(error) => return error_response("invalid_apply_normalization_payload", error),
+    };
+
+    let source = parse_normalization_source(payload.source.as_deref());
+    let source_key = match source {
+        AudioNormalizationSource::Spotify => "spotify",
+        AudioNormalizationSource::Other => "other",
+    };
+    let normalized_volume = {
+        let mut state = match lock_state() {
+            Ok(state) => state,
+            Err(error) => return error_response("bridge_state_error", error),
+        };
+
+        let volume = normalized_volume_for_source(
+            payload.volume_percent,
+            source,
+            &state.audio_normalization,
+            &state.adaptive_normalization,
+        );
+        // Avoid division by zero when volume is 0 (gain stays near 1.0).
+        let gain = volume as f32 / payload.volume_percent.max(1) as f32;
+        state.adaptive_normalization.push_gain(source_key, gain);
+        volume
+    };
+
+    success_response(json!({
+        "normalized_volume_percent": normalized_volume,
+    }))
 }
 
 fn handle_spotify_set_shuffle(config_json: &str) -> String {
@@ -747,11 +967,129 @@ fn handle_spotify_snapshot() -> String {
         "is_playing": snapshot.is_playing,
         "progress_ms": snapshot.progress_ms,
         "end_of_track": snapshot.end_of_track,
-        "volume_percent": snapshot.volume_percent,
+        "volume_percent": state.playback_volume_percent,
+        "output_volume_percent": snapshot.volume_percent,
         "shuffle_enabled": state.playback_shuffle,
         "repeat_mode": state.playback_repeat_mode.as_snapshot_str(),
         "current_track_id": current_track_id
     }))
+}
+
+fn page_slice<T>(items: Vec<T>, offset: usize, limit: usize) -> Vec<T> {
+    items.into_iter().skip(offset).take(limit).collect()
+}
+
+fn require_field(value: Option<String>, field: &str) -> Result<String, String> {
+    match value.map(|v| v.trim().to_string()) {
+        Some(v) if !v.is_empty() => Ok(v),
+        _ => Err(format!("Missing required provider field: {}", field)),
+    }
+}
+
+fn json_value<T: serde::Serialize>(value: T) -> Result<Value, String> {
+    serde_json::to_value(value)
+        .map_err(|error| format!("Failed to encode provider response: {}", error))
+}
+
+async fn dispatch_provider_operation(
+    client: &dyn ProviderApi,
+    operation: &str,
+    session: &ProviderAuthRequest,
+    payload: &ProviderApiCallPayload,
+    offset: usize,
+    limit: usize,
+) -> Result<Value, String> {
+    match operation {
+        "validate_connection" => {
+            let validation = client
+                .validate_connection(session)
+                .await
+                .map_err(|error| error.0)?;
+            match validation {
+                ProviderConnectionCheck::Connected { username, metadata } => Ok(json!({
+                    "connected": true,
+                    "username": username,
+                    "metadata": metadata
+                })),
+                ProviderConnectionCheck::Failed(message) => Ok(json!({
+                    "connected": false,
+                    "message": message
+                })),
+            }
+        }
+        "get_playlists" => {
+            let playlists = client
+                .get_playlists(session)
+                .await
+                .map_err(|error| error.0)?;
+            Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
+        }
+        "get_playlist" => {
+            let id = require_field(payload.id.clone(), "id")?;
+            let mut playlist = client
+                .get_playlist(session, &id)
+                .await
+                .map_err(|error| error.0)?;
+            playlist.tracks = page_slice(playlist.tracks, offset, limit);
+            Ok(json!({ "playlist": json_value(playlist)? }))
+        }
+        "search_tracks" => {
+            let query = require_field(payload.query.clone(), "query")?;
+            let tracks = client
+                .search_tracks(session, &query)
+                .await
+                .map_err(|error| error.0)?;
+            Ok(json!({ "tracks": json_value(page_slice(tracks, offset, limit))? }))
+        }
+        "search_playlists" => {
+            let query = require_field(payload.query.clone(), "query")?;
+            let playlists = client
+                .search_playlists(session, &query)
+                .await
+                .map_err(|error| error.0)?;
+            Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
+        }
+        _ => Err(format!(
+            "Unsupported provider operation for {}: {}",
+            client.source(),
+            operation
+        )),
+    }
+}
+
+fn handle_provider_api_call(config_json: &str) -> String {
+    let payload =
+        match parse_required_json::<ProviderApiCallPayload>(config_json, "provider_api_call") {
+            Ok(payload) => payload,
+            Err(error) => return error_response("invalid_provider_api_payload", error),
+        };
+
+    let source = payload.source.trim().to_ascii_lowercase();
+    let operation = payload.operation.trim().to_ascii_lowercase();
+    let offset = payload.offset.unwrap_or(0);
+    let limit = payload.limit.unwrap_or(100).clamp(1, 500);
+    let session = ProviderAuthRequest::new(payload.session.clone());
+
+    let result: Result<Value, String> = TOKIO_RUNTIME.block_on(async {
+        match source.as_str() {
+            "jellyfin" => {
+                let client = JellyfinApiClient::new();
+                dispatch_provider_operation(&client, &operation, &session, &payload, offset, limit)
+                    .await
+            }
+            "plex" => {
+                let client = PlexApiClient::new();
+                dispatch_provider_operation(&client, &operation, &session, &payload, offset, limit)
+                    .await
+            }
+            _ => Err(format!("Unsupported provider source: {}", source)),
+        }
+    });
+
+    match result {
+        Ok(data) => success_response(data),
+        Err(error) => error_response("provider_api_error", error),
+    }
 }
 
 fn into_jstring(env: &mut JNIEnv<'_>, payload: String) -> jstring {
@@ -1030,6 +1368,40 @@ pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_spo
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_getAudioNormalizationSettings(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    into_jstring(&mut env, handle_get_audio_normalization_settings())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_setAudioNormalizationSettings(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    config_json: JString<'_>,
+) -> jstring {
+    let payload = match read_jstring(&mut env, config_json, "config_json") {
+        Ok(value) => handle_set_audio_normalization_settings(&value),
+        Err(error) => error_response("jni_argument_error", error),
+    };
+    into_jstring(&mut env, payload)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_applyAudioNormalizationVolume(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    config_json: JString<'_>,
+) -> jstring {
+    let payload = match read_jstring(&mut env, config_json, "config_json") {
+        Ok(value) => handle_apply_audio_normalization_volume(&value),
+        Err(error) => error_response("jni_argument_error", error),
+    };
+    into_jstring(&mut env, payload)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_spotifySetShuffle(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -1061,6 +1433,19 @@ pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_spo
     _class: JClass<'_>,
 ) -> jstring {
     into_jstring(&mut env, handle_spotify_snapshot())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_providerApiCall(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    config_json: JString<'_>,
+) -> jstring {
+    let payload = match read_jstring(&mut env, config_json, "config_json") {
+        Ok(value) => handle_provider_api_call(&value),
+        Err(error) => error_response("jni_argument_error", error),
+    };
+    into_jstring(&mut env, payload)
 }
 
 #[cfg(test)]
@@ -1131,5 +1516,142 @@ mod tests {
         let payload = parse_json(&handle_spotify_snapshot());
         assert_eq!(payload["ok"], Value::Bool(true));
         assert_eq!(payload["data"]["is_playing"], Value::Bool(false));
+    }
+
+    #[test]
+    fn get_audio_normalization_settings_reflects_state() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        {
+            let mut state = lock_state().expect("lock_state");
+            state.audio_normalization.enabled = true;
+            state.audio_normalization.strict_mode = true;
+            state.audio_normalization.target = INTERNAL_NORMALIZATION_TARGET;
+        }
+
+        let payload = parse_json(&handle_get_audio_normalization_settings());
+        assert_eq!(payload["ok"], Value::Bool(true));
+        assert_eq!(payload["data"]["enabled"], Value::Bool(true));
+        assert_eq!(payload["data"]["strict_mode"], Value::Bool(true));
+        assert_eq!(
+            payload["data"]["target"],
+            Value::Number(INTERNAL_NORMALIZATION_TARGET.into())
+        );
+    }
+
+    #[test]
+    fn set_audio_normalization_settings_updates_state_and_returns_ok() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        {
+            let mut state = lock_state().expect("lock_state");
+            state.playback_volume_percent = 50;
+            state.audio_normalization.enabled = false;
+            state.audio_normalization.strict_mode = false;
+        }
+
+        let payload = parse_json(&handle_set_audio_normalization_settings(
+            r#"{"enabled":true,"strict_mode":true}"#,
+        ));
+        assert_eq!(payload["ok"], Value::Bool(true));
+        assert_eq!(payload["data"]["enabled"], Value::Bool(true));
+        assert_eq!(payload["data"]["strict_mode"], Value::Bool(true));
+        assert_eq!(
+            payload["data"]["target"],
+            Value::Number(INTERNAL_NORMALIZATION_TARGET.into())
+        );
+        assert_eq!(payload["data"]["volume_percent"], Value::Number(50.into()));
+
+        let state = lock_state().expect("lock_state");
+        assert!(state.audio_normalization.enabled);
+        assert!(state.audio_normalization.strict_mode);
+    }
+
+    #[test]
+    fn apply_audio_normalization_volume_returns_normalized_volume() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        {
+            let mut state = lock_state().expect("lock_state");
+            state.audio_normalization.enabled = true;
+            state.audio_normalization.strict_mode = false;
+            state.audio_normalization.target = INTERNAL_NORMALIZATION_TARGET;
+        }
+
+        let payload = parse_json(&handle_apply_audio_normalization_volume(
+            r#"{"volume_percent":60,"source":"spotify"}"#,
+        ));
+        assert_eq!(payload["ok"], Value::Bool(true));
+
+        let normalized = payload["data"]["normalized_volume_percent"]
+            .as_u64()
+            .expect("normalized_volume_percent should be a number");
+        assert!(normalized <= 100);
+    }
+
+    #[test]
+    fn apply_audio_normalization_volume_rejects_invalid_payload() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        let payload = parse_json(&handle_apply_audio_normalization_volume("not-json"));
+        assert_eq!(payload["ok"], Value::Bool(false));
+        assert_eq!(
+            payload["error"]["code"],
+            Value::String("invalid_apply_normalization_payload".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_api_call_rejects_unknown_source() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        let payload = parse_json(&handle_provider_api_call(
+            r#"{"source":"unknown","operation":"get_playlists","session":{}}"#,
+        ));
+        assert_eq!(payload["ok"], Value::Bool(false));
+        assert_eq!(
+            payload["error"]["code"],
+            Value::String("provider_api_error".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_api_call_rejects_invalid_payload() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        let payload = parse_json(&handle_provider_api_call("not-json"));
+        assert_eq!(payload["ok"], Value::Bool(false));
+        assert_eq!(
+            payload["error"]["code"],
+            Value::String("invalid_provider_api_payload".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_api_call_jellyfin_rejects_unknown_operation() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        let payload = parse_json(&handle_provider_api_call(
+            r#"{"source":"jellyfin","operation":"unsupported_op","session":{}}"#,
+        ));
+        assert_eq!(payload["ok"], Value::Bool(false));
+        assert_eq!(
+            payload["error"]["code"],
+            Value::String("provider_api_error".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_api_call_plex_rejects_unknown_operation() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        let payload = parse_json(&handle_provider_api_call(
+            r#"{"source":"plex","operation":"unsupported_op","session":{}}"#,
+        ));
+        assert_eq!(payload["ok"], Value::Bool(false));
+        assert_eq!(
+            payload["error"]["code"],
+            Value::String("provider_api_error".to_string())
+        );
     }
 }

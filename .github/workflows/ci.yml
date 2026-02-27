@@ -19,6 +19,9 @@ jobs:
       - name: Cargo check workspace
         run: cargo check --workspace
 
+      - name: Cargo test workspace
+        run: cargo test --workspace
+
       - name: Run rustfmt
         run: cargo fmt --all -- --check
         continue-on-error: ${{ contains(github.event.head_commit.message, '[skip-format]') }}
