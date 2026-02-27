@@ -980,6 +980,72 @@ fn json_value<T: serde::Serialize>(value: T) -> Result<Value, String> {
         .map_err(|error| format!("Failed to encode provider response: {}", error))
 }
 
+async fn dispatch_provider_operation(
+    client: &dyn ProviderApi,
+    operation: &str,
+    session: &ProviderAuthRequest,
+    payload: &ProviderApiCallPayload,
+    offset: usize,
+    limit: usize,
+) -> Result<Value, String> {
+    match operation {
+        "validate_connection" => {
+            let validation = client
+                .validate_connection(session)
+                .await
+                .map_err(|error| error.0)?;
+            match validation {
+                ProviderConnectionCheck::Connected { username, metadata } => Ok(json!({
+                    "connected": true,
+                    "username": username,
+                    "metadata": metadata
+                })),
+                ProviderConnectionCheck::Failed(message) => Ok(json!({
+                    "connected": false,
+                    "message": message
+                })),
+            }
+        }
+        "get_playlists" => {
+            let playlists = client
+                .get_playlists(session)
+                .await
+                .map_err(|error| error.0)?;
+            Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
+        }
+        "get_playlist" => {
+            let id = require_field(payload.id.clone(), "id")?;
+            let mut playlist = client
+                .get_playlist(session, &id)
+                .await
+                .map_err(|error| error.0)?;
+            playlist.tracks = page_slice(playlist.tracks, offset, limit);
+            Ok(json!({ "playlist": json_value(playlist)? }))
+        }
+        "search_tracks" => {
+            let query = require_field(payload.query.clone(), "query")?;
+            let tracks = client
+                .search_tracks(session, &query)
+                .await
+                .map_err(|error| error.0)?;
+            Ok(json!({ "tracks": json_value(page_slice(tracks, offset, limit))? }))
+        }
+        "search_playlists" => {
+            let query = require_field(payload.query.clone(), "query")?;
+            let playlists = client
+                .search_playlists(session, &query)
+                .await
+                .map_err(|error| error.0)?;
+            Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
+        }
+        _ => Err(format!(
+            "Unsupported provider operation for {}: {}",
+            client.source(),
+            operation
+        )),
+    }
+}
+
 fn handle_provider_api_call(config_json: &str) -> String {
     let payload =
         match parse_required_json::<ProviderApiCallPayload>(config_json, "provider_api_call") {
@@ -997,121 +1063,13 @@ fn handle_provider_api_call(config_json: &str) -> String {
         match source.as_str() {
             "jellyfin" => {
                 let client = JellyfinApiClient::new();
-                match operation.as_str() {
-                    "validate_connection" => {
-                        let validation = client
-                            .validate_connection(&session)
-                            .await
-                            .map_err(|error| error.0)?;
-                        match validation {
-                            ProviderConnectionCheck::Connected { username, metadata } => {
-                                Ok(json!({
-                                    "connected": true,
-                                    "username": username,
-                                    "metadata": metadata
-                                }))
-                            }
-                            ProviderConnectionCheck::Failed(message) => {
-                                Ok(json!({
-                                    "connected": false,
-                                    "message": message
-                                }))
-                            }
-                        }
-                    }
-                    "get_playlists" => {
-                        let playlists = client
-                            .get_playlists(&session)
-                            .await
-                            .map_err(|error| error.0)?;
-                        Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
-                    }
-                    "get_playlist" => {
-                        let id = require_field(payload.id.clone(), "id")?;
-                        let mut playlist = client
-                            .get_playlist(&session, &id)
-                            .await
-                            .map_err(|error| error.0)?;
-                        playlist.tracks = page_slice(playlist.tracks, offset, limit);
-                        Ok(json!({ "playlist": json_value(playlist)? }))
-                    }
-                    "search_tracks" => {
-                        let query = require_field(payload.query.clone(), "query")?;
-                        let tracks = client
-                            .search_tracks(&session, &query)
-                            .await
-                            .map_err(|error| error.0)?;
-                        Ok(json!({ "tracks": json_value(page_slice(tracks, offset, limit))? }))
-                    }
-                    "search_playlists" => {
-                        let query = require_field(payload.query.clone(), "query")?;
-                        let playlists = client
-                            .search_playlists(&session, &query)
-                            .await
-                            .map_err(|error| error.0)?;
-                        Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
-                    }
-                    _ => Err(format!("Unsupported provider operation for Jellyfin: {}", operation)),
-                }
+                dispatch_provider_operation(&client, &operation, &session, &payload, offset, limit)
+                    .await
             }
             "plex" => {
                 let client = PlexApiClient::new();
-                match operation.as_str() {
-                    "validate_connection" => {
-                        let validation = client
-                            .validate_connection(&session)
-                            .await
-                            .map_err(|error| error.0)?;
-                        match validation {
-                            ProviderConnectionCheck::Connected { username, metadata } => {
-                                Ok(json!({
-                                    "connected": true,
-                                    "username": username,
-                                    "metadata": metadata
-                                }))
-                            }
-                            ProviderConnectionCheck::Failed(message) => {
-                                Ok(json!({
-                                    "connected": false,
-                                    "message": message
-                                }))
-                            }
-                        }
-                    }
-                    "get_playlists" => {
-                        let playlists = client
-                            .get_playlists(&session)
-                            .await
-                            .map_err(|error| error.0)?;
-                        Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
-                    }
-                    "get_playlist" => {
-                        let id = require_field(payload.id.clone(), "id")?;
-                        let mut playlist = client
-                            .get_playlist(&session, &id)
-                            .await
-                            .map_err(|error| error.0)?;
-                        playlist.tracks = page_slice(playlist.tracks, offset, limit);
-                        Ok(json!({ "playlist": json_value(playlist)? }))
-                    }
-                    "search_tracks" => {
-                        let query = require_field(payload.query.clone(), "query")?;
-                        let tracks = client
-                            .search_tracks(&session, &query)
-                            .await
-                            .map_err(|error| error.0)?;
-                        Ok(json!({ "tracks": json_value(page_slice(tracks, offset, limit))? }))
-                    }
-                    "search_playlists" => {
-                        let query = require_field(payload.query.clone(), "query")?;
-                        let playlists = client
-                            .search_playlists(&session, &query)
-                            .await
-                            .map_err(|error| error.0)?;
-                        Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
-                    }
-                    _ => Err(format!("Unsupported provider operation for Plex: {}", operation)),
-                }
+                dispatch_provider_operation(&client, &operation, &session, &payload, offset, limit)
+                    .await
             }
             _ => Err(format!("Unsupported provider source: {}", source)),
         }
@@ -1547,5 +1505,142 @@ mod tests {
         let payload = parse_json(&handle_spotify_snapshot());
         assert_eq!(payload["ok"], Value::Bool(true));
         assert_eq!(payload["data"]["is_playing"], Value::Bool(false));
+    }
+
+    #[test]
+    fn get_audio_normalization_settings_reflects_state() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        {
+            let mut state = lock_state().expect("lock_state");
+            state.audio_normalization.enabled = true;
+            state.audio_normalization.strict_mode = true;
+            state.audio_normalization.target = INTERNAL_NORMALIZATION_TARGET;
+        }
+
+        let payload = parse_json(&handle_get_audio_normalization_settings());
+        assert_eq!(payload["ok"], Value::Bool(true));
+        assert_eq!(payload["data"]["enabled"], Value::Bool(true));
+        assert_eq!(payload["data"]["strict_mode"], Value::Bool(true));
+        assert_eq!(
+            payload["data"]["target"],
+            Value::Number(INTERNAL_NORMALIZATION_TARGET.into())
+        );
+    }
+
+    #[test]
+    fn set_audio_normalization_settings_updates_state_and_returns_ok() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        {
+            let mut state = lock_state().expect("lock_state");
+            state.playback_volume_percent = 50;
+            state.audio_normalization.enabled = false;
+            state.audio_normalization.strict_mode = false;
+        }
+
+        let payload = parse_json(&handle_set_audio_normalization_settings(
+            r#"{"enabled":true,"strict_mode":true}"#,
+        ));
+        assert_eq!(payload["ok"], Value::Bool(true));
+        assert_eq!(payload["data"]["enabled"], Value::Bool(true));
+        assert_eq!(payload["data"]["strict_mode"], Value::Bool(true));
+        assert_eq!(
+            payload["data"]["target"],
+            Value::Number(INTERNAL_NORMALIZATION_TARGET.into())
+        );
+        assert_eq!(payload["data"]["volume_percent"], Value::Number(50.into()));
+
+        let state = lock_state().expect("lock_state");
+        assert!(state.audio_normalization.enabled);
+        assert!(state.audio_normalization.strict_mode);
+    }
+
+    #[test]
+    fn apply_audio_normalization_volume_returns_normalized_volume() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        {
+            let mut state = lock_state().expect("lock_state");
+            state.audio_normalization.enabled = true;
+            state.audio_normalization.strict_mode = false;
+            state.audio_normalization.target = INTERNAL_NORMALIZATION_TARGET;
+        }
+
+        let payload = parse_json(&handle_apply_audio_normalization_volume(
+            r#"{"volume_percent":60,"source":"spotify"}"#,
+        ));
+        assert_eq!(payload["ok"], Value::Bool(true));
+
+        let normalized = payload["data"]["normalized_volume_percent"]
+            .as_u64()
+            .expect("normalized_volume_percent should be a number");
+        assert!(normalized <= 100);
+    }
+
+    #[test]
+    fn apply_audio_normalization_volume_rejects_invalid_payload() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        let payload = parse_json(&handle_apply_audio_normalization_volume("not-json"));
+        assert_eq!(payload["ok"], Value::Bool(false));
+        assert_eq!(
+            payload["error"]["code"],
+            Value::String("invalid_apply_normalization_payload".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_api_call_rejects_unknown_source() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        let payload = parse_json(&handle_provider_api_call(
+            r#"{"source":"unknown","operation":"get_playlists","session":{}}"#,
+        ));
+        assert_eq!(payload["ok"], Value::Bool(false));
+        assert_eq!(
+            payload["error"]["code"],
+            Value::String("provider_api_error".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_api_call_rejects_invalid_payload() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        let payload = parse_json(&handle_provider_api_call("not-json"));
+        assert_eq!(payload["ok"], Value::Bool(false));
+        assert_eq!(
+            payload["error"]["code"],
+            Value::String("invalid_provider_api_payload".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_api_call_jellyfin_rejects_unknown_operation() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        let payload = parse_json(&handle_provider_api_call(
+            r#"{"source":"jellyfin","operation":"unsupported_op","session":{}}"#,
+        ));
+        assert_eq!(payload["ok"], Value::Bool(false));
+        assert_eq!(
+            payload["error"]["code"],
+            Value::String("provider_api_error".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_api_call_plex_rejects_unknown_operation() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        let payload = parse_json(&handle_provider_api_call(
+            r#"{"source":"plex","operation":"unsupported_op","session":{}}"#,
+        ));
+        assert_eq!(payload["ok"], Value::Bool(false));
+        assert_eq!(
+            payload["error"]["code"],
+            Value::String("provider_api_error".to_string())
+        );
     }
 }

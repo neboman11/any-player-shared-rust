@@ -1,17 +1,30 @@
 use std::collections::{HashMap, VecDeque};
 
+/// Internal loudness target used when normalizing audio, expressed as a
+/// percentage (0–100). Callers may not override this value at runtime.
 pub const INTERNAL_NORMALIZATION_TARGET: u32 = 85;
 
+/// Identifies the content source for audio normalization calculations.
+///
+/// Different sources have different loudness characteristics and therefore
+/// require different normalization strategies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioNormalizationSource {
+    /// Audio streamed from Spotify via librespot.
     Spotify,
+    /// Audio from any other provider (e.g. Jellyfin, Plex).
     Other,
 }
 
+/// User-facing settings that control the audio normalization pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioNormalizationSettings {
+    /// Whether audio normalization is active.
     pub enabled: bool,
+    /// Target loudness level (0–100). Clamped to 100 at runtime.
     pub target: u32,
+    /// When `true`, applies adaptive per-source compensation on top of the
+    /// base normalization to reduce perceived loudness variance across sources.
     pub strict_mode: bool,
 }
 
@@ -25,6 +38,11 @@ impl Default for AudioNormalizationSettings {
     }
 }
 
+/// Rolling history of applied gain values used to adapt normalization over time.
+///
+/// Maintains both a global gain history and per-source histories so that
+/// [`strict_compensation_gain`](AdaptiveNormalizationState::strict_compensation_gain)
+/// can compute a source-aware correction factor.
 #[derive(Debug, Clone)]
 pub struct AdaptiveNormalizationState {
     global_history: VecDeque<f32>,
@@ -44,6 +62,11 @@ impl AdaptiveNormalizationState {
     const MAX_GLOBAL_SAMPLES: usize = 64;
     const MAX_SOURCE_SAMPLES: usize = 24;
 
+    /// Records a gain value applied for a given source.
+    ///
+    /// `gain` is clamped to `[0.25, 3.0]` (approximately −12 dB to +9.5 dB)
+    /// before being stored to prevent extreme outliers from skewing future
+    /// compensation calculations.
     pub fn push_gain(&mut self, source: &str, gain: f32) {
         let clamped_gain = gain.clamp(0.25, 3.0);
 
@@ -71,6 +94,12 @@ impl AdaptiveNormalizationState {
         Some(sum_db / (history.len() as f32))
     }
 
+    /// Returns a compensation gain factor for `source` based on the recorded
+    /// gain history.
+    ///
+    /// Returns `1.0` (no adjustment) when there is insufficient history to
+    /// make a reliable estimate. The returned value is always clamped to
+    /// `[0.7, 1.3]`.
     pub fn strict_compensation_gain(&self, source: &str) -> f32 {
         if self.global_history.len() < 6 {
             return 1.0;
@@ -81,16 +110,10 @@ impl AdaptiveNormalizationState {
             None => return 1.0,
         };
 
-        let source_history = self.source_history.get(source);
-
-        if source_history.is_none() {
-            return (10.0_f32.powf(global_avg_db / 20.0)).clamp(0.7, 1.3);
-        }
-
-        let source_history = source_history.expect("checked above");
-        if source_history.len() < 4 {
-            return (10.0_f32.powf(global_avg_db / 20.0)).clamp(0.7, 1.3);
-        }
+        let source_history = match self.source_history.get(source) {
+            Some(history) if history.len() >= 4 => history,
+            _ => return (10.0_f32.powf(global_avg_db / 20.0)).clamp(0.7, 1.3),
+        };
 
         let source_avg_db = match Self::avg_db(source_history) {
             Some(value) => value,
@@ -102,10 +125,15 @@ impl AdaptiveNormalizationState {
     }
 }
 
+/// Clamps `target` to the valid loudness range (0–100).
 pub fn clamp_target(target: u32) -> u32 {
     target.min(100)
 }
 
+/// Converts a loudness `target` percentage into a linear RMS scale factor.
+///
+/// The factor is always in `[0.1, 1.0]`, with higher targets producing values
+/// closer to 1.0 (full volume).
 pub fn normalization_target_runtime_factor(target: u32) -> f32 {
     let clamped = clamp_target(target);
     let normalized = (clamped as f32) / 100.0;
@@ -114,6 +142,14 @@ pub fn normalization_target_runtime_factor(target: u32) -> f32 {
     (target_rms / max_target_rms).clamp(0.1, 1.0)
 }
 
+/// Computes the effective output volume after applying normalization.
+///
+/// When normalization is disabled the `base_volume` is returned unchanged.
+/// Otherwise the volume is scaled by the target factor appropriate for
+/// `source` and then further adjusted by `strict_gain` (typically from
+/// [`AdaptiveNormalizationState::strict_compensation_gain`]).
+///
+/// The returned value is always in `[0, 100]`.
 pub fn effective_output_volume(
     base_volume: u32,
     source: AudioNormalizationSource,
