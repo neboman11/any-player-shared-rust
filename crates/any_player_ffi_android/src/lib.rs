@@ -1,3 +1,11 @@
+use any_player_core::audio_normalization::{
+    AdaptiveNormalizationState, AudioNormalizationSettings, AudioNormalizationSource,
+    INTERNAL_NORMALIZATION_TARGET, effective_output_volume,
+};
+use any_player_core::provider_api::ProviderApi;
+use any_player_core::provider_api::ProviderConnectionCheck;
+use any_player_core::provider_clients::{jellyfin::JellyfinApiClient, plex::PlexApiClient};
+use any_player_core::providers::ProviderAuthRequest;
 use any_player_spotify_engine::{
     LibrespotPlayer, SpotifyEngineError, SpotifySessionBackend, SpotifySessionConfig,
     SpotifySessionEngine, SpotifyToken,
@@ -9,6 +17,7 @@ use jni::sys::jstring;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Builder, Runtime};
@@ -52,8 +61,11 @@ struct BridgeState {
     // Local playback state mirrored for snapshot responses.
     playback_queue: Vec<String>,
     playback_index: usize,
+    playback_volume_percent: u8,
     playback_shuffle: bool,
     playback_repeat_mode: RepeatModeState,
+    audio_normalization: AudioNormalizationSettings,
+    adaptive_normalization: AdaptiveNormalizationState,
 }
 
 impl Default for BridgeState {
@@ -64,8 +76,15 @@ impl Default for BridgeState {
             playback_access_token: None,
             playback_queue: Vec::new(),
             playback_index: 0,
+            playback_volume_percent: 100,
             playback_shuffle: false,
             playback_repeat_mode: RepeatModeState::Off,
+            audio_normalization: AudioNormalizationSettings {
+                enabled: false,
+                target: INTERNAL_NORMALIZATION_TARGET,
+                strict_mode: false,
+            },
+            adaptive_normalization: AdaptiveNormalizationState::default(),
         }
     }
 }
@@ -170,6 +189,35 @@ struct RepeatModePayload {
     mode: String,
 }
 
+#[derive(Deserialize)]
+struct AudioNormalizationSettingsPayload {
+    enabled: bool,
+    #[serde(default)]
+    strict_mode: bool,
+}
+
+#[derive(Deserialize)]
+struct ApplyNormalizationPayload {
+    volume_percent: i32,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderApiCallPayload {
+    source: String,
+    operation: String,
+    session: HashMap<String, String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 fn current_epoch_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -200,6 +248,45 @@ fn lock_state() -> Result<std::sync::MutexGuard<'static, BridgeState>, String> {
     BRIDGE_STATE
         .lock()
         .map_err(|_| "Bridge state mutex poisoned".to_string())
+}
+
+fn parse_normalization_source(source: Option<&str>) -> AudioNormalizationSource {
+    match source
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "other".to_string())
+        .as_str()
+    {
+        "spotify" => AudioNormalizationSource::Spotify,
+        _ => AudioNormalizationSource::Other,
+    }
+}
+
+fn strict_gain_for_source(
+    settings: &AudioNormalizationSettings,
+    adaptive_state: &AdaptiveNormalizationState,
+    source: AudioNormalizationSource,
+) -> f32 {
+    if !settings.strict_mode {
+        return 1.0;
+    }
+
+    let source_key = match source {
+        AudioNormalizationSource::Spotify => "spotify",
+        AudioNormalizationSource::Other => "other",
+    };
+
+    adaptive_state.strict_compensation_gain(source_key)
+}
+
+fn normalized_volume_for_source(
+    base_volume_percent: i32,
+    source: AudioNormalizationSource,
+    settings: &AudioNormalizationSettings,
+    adaptive_state: &AdaptiveNormalizationState,
+) -> u8 {
+    let clamped_base = base_volume_percent.clamp(0, 100) as u32;
+    let strict_gain = strict_gain_for_source(settings, adaptive_state, source);
+    effective_output_volume(clamped_base, source, settings, strict_gain) as u8
 }
 
 fn parse_required_json<T>(raw_json: &str, field_name: &str) -> Result<T, String>
@@ -517,10 +604,25 @@ fn handle_spotify_start_queue(config_json: &str) -> String {
     }
 
     // Start decoding + playing audio directly via rodio — no Spotify Connect device needed.
-    if let Err(error) =
-        TOKIO_RUNTIME.block_on(PLAYER.start_queue(&normalized_track_ids, start_index))
-    {
+    if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.start_queue(&normalized_track_ids, start_index)) {
         return error_response("librespot_start_queue_failed", error.message);
+    }
+
+    // Apply current effective output volume right after queue start.
+    let output_volume = {
+        let state = match lock_state() {
+            Ok(state) => state,
+            Err(error) => return error_response("bridge_state_error", error),
+        };
+        normalized_volume_for_source(
+            state.playback_volume_percent as i32,
+            AudioNormalizationSource::Spotify,
+            &state.audio_normalization,
+            &state.adaptive_normalization,
+        )
+    };
+    if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.set_volume(output_volume)) {
+        return error_response("librespot_set_volume_failed", error.message);
     }
 
     let mut state = match lock_state() {
@@ -688,10 +790,113 @@ fn handle_spotify_set_volume(config_json: &str) -> String {
         Err(error) => return error_response("invalid_set_volume_payload", error),
     };
 
-    let volume_percent = payload.volume_percent.clamp(0, 100) as u8;
-    run_connected_player_command(json!({ "volume_percent": volume_percent }), || {
-        TOKIO_RUNTIME.block_on(PLAYER.set_volume(volume_percent))
-    })
+    let (requested_volume_percent, output_volume_percent) = {
+        let mut state = match lock_state() {
+            Ok(state) => state,
+            Err(error) => return error_response("bridge_state_error", error),
+        };
+
+        let requested = payload.volume_percent.clamp(0, 100) as u8;
+        let output = normalized_volume_for_source(
+            requested as i32,
+            AudioNormalizationSource::Spotify,
+            &state.audio_normalization,
+            &state.adaptive_normalization,
+        );
+        state.playback_volume_percent = requested;
+        (requested, output)
+    };
+
+    run_connected_player_command(
+        json!({
+            "volume_percent": requested_volume_percent,
+            "output_volume_percent": output_volume_percent
+        }),
+        || TOKIO_RUNTIME.block_on(PLAYER.set_volume(output_volume_percent)),
+    )
+}
+
+fn handle_get_audio_normalization_settings() -> String {
+    let state = match lock_state() {
+        Ok(state) => state,
+        Err(error) => return error_response("bridge_state_error", error),
+    };
+
+    success_response(json!({
+        "enabled": state.audio_normalization.enabled,
+        "strict_mode": state.audio_normalization.strict_mode,
+        "target": state.audio_normalization.target,
+    }))
+}
+
+fn handle_set_audio_normalization_settings(config_json: &str) -> String {
+    let payload =
+        match parse_required_json::<AudioNormalizationSettingsPayload>(config_json, "set_audio_normalization_settings") {
+            Ok(payload) => payload,
+            Err(error) => return error_response("invalid_audio_normalization_payload", error),
+        };
+
+    let (requested_volume_percent, output_volume_percent) = {
+        let mut state = match lock_state() {
+            Ok(state) => state,
+            Err(error) => return error_response("bridge_state_error", error),
+        };
+
+        state.audio_normalization.enabled = payload.enabled;
+        state.audio_normalization.strict_mode = payload.strict_mode;
+        state.audio_normalization.target = INTERNAL_NORMALIZATION_TARGET;
+
+        let output = normalized_volume_for_source(
+            state.playback_volume_percent as i32,
+            AudioNormalizationSource::Spotify,
+            &state.audio_normalization,
+            &state.adaptive_normalization,
+        );
+        (state.playback_volume_percent, output)
+    };
+
+    if TOKIO_RUNTIME.block_on(PLAYER.is_connected()) {
+        if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.set_volume(output_volume_percent)) {
+            return error_response("librespot_set_volume_failed", error.message);
+        }
+    }
+
+    success_response(json!({
+        "enabled": payload.enabled,
+        "strict_mode": payload.strict_mode,
+        "target": INTERNAL_NORMALIZATION_TARGET,
+        "volume_percent": requested_volume_percent,
+        "output_volume_percent": output_volume_percent,
+    }))
+}
+
+fn handle_apply_audio_normalization_volume(config_json: &str) -> String {
+    let payload = match parse_required_json::<ApplyNormalizationPayload>(
+        config_json,
+        "apply_audio_normalization_volume",
+    ) {
+        Ok(payload) => payload,
+        Err(error) => return error_response("invalid_apply_normalization_payload", error),
+    };
+
+    let source = parse_normalization_source(payload.source.as_deref());
+    let normalized_volume = {
+        let state = match lock_state() {
+            Ok(state) => state,
+            Err(error) => return error_response("bridge_state_error", error),
+        };
+
+        normalized_volume_for_source(
+            payload.volume_percent,
+            source,
+            &state.audio_normalization,
+            &state.adaptive_normalization,
+        )
+    };
+
+    success_response(json!({
+        "normalized_volume_percent": normalized_volume,
+    }))
 }
 
 fn handle_spotify_set_shuffle(config_json: &str) -> String {
@@ -747,11 +952,169 @@ fn handle_spotify_snapshot() -> String {
         "is_playing": snapshot.is_playing,
         "progress_ms": snapshot.progress_ms,
         "end_of_track": snapshot.end_of_track,
-        "volume_percent": snapshot.volume_percent,
+        "volume_percent": state.playback_volume_percent,
+        "output_volume_percent": snapshot.volume_percent,
         "shuffle_enabled": state.playback_shuffle,
         "repeat_mode": state.playback_repeat_mode.as_snapshot_str(),
         "current_track_id": current_track_id
     }))
+}
+
+fn page_slice<T>(items: Vec<T>, offset: usize, limit: usize) -> Vec<T> {
+    items.into_iter().skip(offset).take(limit).collect()
+}
+
+fn require_field(value: Option<String>, field: &str) -> Result<String, String> {
+    match value.map(|v| v.trim().to_string()) {
+        Some(v) if !v.is_empty() => Ok(v),
+        _ => Err(format!("Missing required provider field: {}", field)),
+    }
+}
+
+fn json_value<T: serde::Serialize>(value: T) -> Result<Value, String> {
+    serde_json::to_value(value).map_err(|error| format!("Failed to encode provider response: {}", error))
+}
+
+fn handle_provider_api_call(config_json: &str) -> String {
+    let payload = match parse_required_json::<ProviderApiCallPayload>(config_json, "provider_api_call") {
+        Ok(payload) => payload,
+        Err(error) => return error_response("invalid_provider_api_payload", error),
+    };
+
+    let source = payload.source.trim().to_ascii_lowercase();
+    let operation = payload.operation.trim().to_ascii_lowercase();
+    let offset = payload.offset.unwrap_or(0);
+    let limit = payload.limit.unwrap_or(100).clamp(1, 500);
+    let session = ProviderAuthRequest::new(payload.session.clone());
+
+    let result: Result<Value, String> = TOKIO_RUNTIME.block_on(async {
+        match source.as_str() {
+            "jellyfin" => {
+                let client = JellyfinApiClient::new();
+                match operation.as_str() {
+                    "validate_connection" => {
+                        let validation = client
+                            .validate_connection(&session)
+                            .await
+                            .map_err(|error| error.0)?;
+                        match validation {
+                            ProviderConnectionCheck::Connected { username, metadata } => {
+                                Ok(json!({
+                                    "connected": true,
+                                    "username": username,
+                                    "metadata": metadata
+                                }))
+                            }
+                            ProviderConnectionCheck::Failed(message) => {
+                                Ok(json!({
+                                    "connected": false,
+                                    "message": message
+                                }))
+                            }
+                        }
+                    }
+                    "get_playlists" => {
+                        let playlists = client
+                            .get_playlists(&session)
+                            .await
+                            .map_err(|error| error.0)?;
+                        Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
+                    }
+                    "get_playlist" => {
+                        let id = require_field(payload.id.clone(), "id")?;
+                        let mut playlist = client
+                            .get_playlist(&session, &id)
+                            .await
+                            .map_err(|error| error.0)?;
+                        playlist.tracks = page_slice(playlist.tracks, offset, limit);
+                        Ok(json!({ "playlist": json_value(playlist)? }))
+                    }
+                    "search_tracks" => {
+                        let query = require_field(payload.query.clone(), "query")?;
+                        let tracks = client
+                            .search_tracks(&session, &query)
+                            .await
+                            .map_err(|error| error.0)?;
+                        Ok(json!({ "tracks": json_value(page_slice(tracks, offset, limit))? }))
+                    }
+                    "search_playlists" => {
+                        let query = require_field(payload.query.clone(), "query")?;
+                        let playlists = client
+                            .search_playlists(&session, &query)
+                            .await
+                            .map_err(|error| error.0)?;
+                        Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
+                    }
+                    _ => Err(format!("Unsupported provider operation for Jellyfin: {}", operation)),
+                }
+            }
+            "plex" => {
+                let client = PlexApiClient::new();
+                match operation.as_str() {
+                    "validate_connection" => {
+                        let validation = client
+                            .validate_connection(&session)
+                            .await
+                            .map_err(|error| error.0)?;
+                        match validation {
+                            ProviderConnectionCheck::Connected { username, metadata } => {
+                                Ok(json!({
+                                    "connected": true,
+                                    "username": username,
+                                    "metadata": metadata
+                                }))
+                            }
+                            ProviderConnectionCheck::Failed(message) => {
+                                Ok(json!({
+                                    "connected": false,
+                                    "message": message
+                                }))
+                            }
+                        }
+                    }
+                    "get_playlists" => {
+                        let playlists = client
+                            .get_playlists(&session)
+                            .await
+                            .map_err(|error| error.0)?;
+                        Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
+                    }
+                    "get_playlist" => {
+                        let id = require_field(payload.id.clone(), "id")?;
+                        let mut playlist = client
+                            .get_playlist(&session, &id)
+                            .await
+                            .map_err(|error| error.0)?;
+                        playlist.tracks = page_slice(playlist.tracks, offset, limit);
+                        Ok(json!({ "playlist": json_value(playlist)? }))
+                    }
+                    "search_tracks" => {
+                        let query = require_field(payload.query.clone(), "query")?;
+                        let tracks = client
+                            .search_tracks(&session, &query)
+                            .await
+                            .map_err(|error| error.0)?;
+                        Ok(json!({ "tracks": json_value(page_slice(tracks, offset, limit))? }))
+                    }
+                    "search_playlists" => {
+                        let query = require_field(payload.query.clone(), "query")?;
+                        let playlists = client
+                            .search_playlists(&session, &query)
+                            .await
+                            .map_err(|error| error.0)?;
+                        Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
+                    }
+                    _ => Err(format!("Unsupported provider operation for Plex: {}", operation)),
+                }
+            }
+            _ => Err(format!("Unsupported provider source: {}", source)),
+        }
+    });
+
+    match result {
+        Ok(data) => success_response(data),
+        Err(error) => error_response("provider_api_error", error),
+    }
 }
 
 fn into_jstring(env: &mut JNIEnv<'_>, payload: String) -> jstring {
@@ -1030,6 +1393,40 @@ pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_spo
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_getAudioNormalizationSettings(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    into_jstring(&mut env, handle_get_audio_normalization_settings())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_setAudioNormalizationSettings(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    config_json: JString<'_>,
+) -> jstring {
+    let payload = match read_jstring(&mut env, config_json, "config_json") {
+        Ok(value) => handle_set_audio_normalization_settings(&value),
+        Err(error) => error_response("jni_argument_error", error),
+    };
+    into_jstring(&mut env, payload)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_applyAudioNormalizationVolume(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    config_json: JString<'_>,
+) -> jstring {
+    let payload = match read_jstring(&mut env, config_json, "config_json") {
+        Ok(value) => handle_apply_audio_normalization_volume(&value),
+        Err(error) => error_response("jni_argument_error", error),
+    };
+    into_jstring(&mut env, payload)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_spotifySetShuffle(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -1061,6 +1458,19 @@ pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_spo
     _class: JClass<'_>,
 ) -> jstring {
     into_jstring(&mut env, handle_spotify_snapshot())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_providerApiCall(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    config_json: JString<'_>,
+) -> jstring {
+    let payload = match read_jstring(&mut env, config_json, "config_json") {
+        Ok(value) => handle_provider_api_call(&value),
+        Err(error) => error_response("jni_argument_error", error),
+    };
+    into_jstring(&mut env, payload)
 }
 
 #[cfg(test)]
