@@ -1,2 +1,2 @@
 /target
-Cargo.lock
+/patches/librespot-core/Cargo.lock
