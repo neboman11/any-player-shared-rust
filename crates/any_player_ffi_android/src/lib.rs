@@ -805,9 +805,6 @@ fn handle_spotify_set_volume(config_json: &str) -> String {
             &state.audio_normalization,
             &state.adaptive_normalization,
         );
-        // Avoid division by zero when volume is 0 (gain stays near 1.0).
-        let gain = output as f32 / requested.max(1) as f32;
-        state.adaptive_normalization.push_gain("spotify", gain);
         state.playback_volume_percent = requested;
         (requested, output)
     };
@@ -887,26 +884,18 @@ fn handle_apply_audio_normalization_volume(config_json: &str) -> String {
     };
 
     let source = parse_normalization_source(payload.source.as_deref());
-    let source_key = match source {
-        AudioNormalizationSource::Spotify => "spotify",
-        AudioNormalizationSource::Other => "other",
-    };
     let normalized_volume = {
-        let mut state = match lock_state() {
+        let state = match lock_state() {
             Ok(state) => state,
             Err(error) => return error_response("bridge_state_error", error),
         };
 
-        let volume = normalized_volume_for_source(
+        normalized_volume_for_source(
             payload.volume_percent,
             source,
             &state.audio_normalization,
             &state.adaptive_normalization,
-        );
-        // Avoid division by zero when volume is 0 (gain stays near 1.0).
-        let gain = volume as f32 / payload.volume_percent.max(1) as f32;
-        state.adaptive_normalization.push_gain(source_key, gain);
-        volume
+        )
     };
 
     success_response(json!({
