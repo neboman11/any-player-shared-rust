@@ -173,10 +173,9 @@ mod tests {
     ///   - each expected duplicate ID appears in the group's occurrences
     #[test]
     fn fixture_all_cases() {
-        let fixture_path = format!(
-            "{}/test-fixtures/dedup_spec.json",
-            env!("CARGO_MANIFEST_DIR")
-        );
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test-fixtures")
+            .join("dedup_spec.json");
         let fixture_json = std::fs::read_to_string(&fixture_path)
             .expect("Failed to read dedup_spec.json fixture");
         let spec: FixtureSpec =
