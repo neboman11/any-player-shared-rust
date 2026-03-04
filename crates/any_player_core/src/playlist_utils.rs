@@ -13,10 +13,7 @@ use serde::{Deserialize, Serialize};
 /// strings into a single delimited string (e.g. when a title or artist
 /// contains the delimiter character).
 pub fn duplicate_key(title: &str, artist: &str) -> (String, String) {
-    (
-        title.trim().to_lowercase(),
-        artist.trim().to_lowercase(),
-    )
+    (title.trim().to_lowercase(), artist.trim().to_lowercase())
 }
 
 /// A single occurrence of a duplicate track within the original input list.
@@ -176,8 +173,8 @@ mod tests {
         let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("test-fixtures")
             .join("dedup_spec.json");
-        let fixture_json = std::fs::read_to_string(&fixture_path)
-            .expect("Failed to read dedup_spec.json fixture");
+        let fixture_json =
+            std::fs::read_to_string(&fixture_path).expect("Failed to read dedup_spec.json fixture");
         let spec: FixtureSpec =
             serde_json::from_str(&fixture_json).expect("Failed to parse dedup_spec.json");
 
@@ -218,16 +215,17 @@ mod tests {
 
                 // first_occurrence_index
                 assert_eq!(
-                    actual.first_occurrence_index,
-                    expected.first_occurrence_index,
+                    actual.first_occurrence_index, expected.first_occurrence_index,
                     "[{}] first_occurrence_index mismatch for key {:?}",
-                    case.id,
-                    expected.key
+                    case.id, expected.key
                 );
 
                 // first occurrence track must be in deduped list
                 assert!(
-                    result.tracks.iter().any(|t| t.id == expected.first_occurrence_id),
+                    result
+                        .tracks
+                        .iter()
+                        .any(|t| t.id == expected.first_occurrence_id),
                     "[{}] first occurrence '{}' not found in deduped tracks",
                     case.id,
                     expected.first_occurrence_id
@@ -290,14 +288,32 @@ mod tests {
     #[test]
     fn deduplicate_tracks_preserves_first_occurrence_order() {
         let tracks: Vec<Track> = vec![
-            make_track(&FixtureTrack { id: "a".into(), title: "Z Song".into(), artist: "B".into() }),
-            make_track(&FixtureTrack { id: "b".into(), title: "A Song".into(), artist: "B".into() }),
-            make_track(&FixtureTrack { id: "c".into(), title: "Z Song".into(), artist: "B".into() }),
+            make_track(&FixtureTrack {
+                id: "a".into(),
+                title: "Z Song".into(),
+                artist: "B".into(),
+            }),
+            make_track(&FixtureTrack {
+                id: "b".into(),
+                title: "A Song".into(),
+                artist: "B".into(),
+            }),
+            make_track(&FixtureTrack {
+                id: "c".into(),
+                title: "Z Song".into(),
+                artist: "B".into(),
+            }),
         ];
         let result = deduplicate_tracks(&tracks);
         assert_eq!(result.tracks.len(), 2);
-        assert_eq!(result.tracks[0].id, "a", "first occurrence of Z Song must be kept");
-        assert_eq!(result.tracks[1].id, "b", "A Song must follow in original order");
+        assert_eq!(
+            result.tracks[0].id, "a",
+            "first occurrence of Z Song must be kept"
+        );
+        assert_eq!(
+            result.tracks[1].id, "b",
+            "A Song must follow in original order"
+        );
         assert_eq!(result.duplicate_groups.len(), 1);
         assert_eq!(result.duplicate_groups[0].first_occurrence_index, 0);
     }
