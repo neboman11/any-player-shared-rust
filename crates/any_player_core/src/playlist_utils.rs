@@ -6,14 +6,16 @@
 use crate::models::Track;
 use serde::{Deserialize, Serialize};
 
-/// Returns the normalized dedup key for a title+artist pair.
+/// Returns the normalized dedup key for a title+artist pair as a tuple.
 ///
-/// Format: `"{lowercase_trimmed_title}|{lowercase_trimmed_artist}"`
-pub fn duplicate_key(title: &str, artist: &str) -> String {
-    format!(
-        "{}|{}",
+/// Returns `(lowercase_trimmed_title, lowercase_trimmed_artist)`.
+/// Using a tuple avoids false collisions that would arise from embedding both
+/// strings into a single delimited string (e.g. when a title or artist
+/// contains the delimiter character).
+pub fn duplicate_key(title: &str, artist: &str) -> (String, String) {
+    (
         title.trim().to_lowercase(),
-        artist.trim().to_lowercase()
+        artist.trim().to_lowercase(),
     )
 }
 
@@ -32,8 +34,8 @@ pub struct DuplicateOccurrence {
 /// occurrences are recorded here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DuplicateGroup {
-    /// Normalized dedup key: `"{title_lower_trim}|{artist_lower_trim}"`.
-    pub key: String,
+    /// Normalized dedup key as `(lowercase_trimmed_title, lowercase_trimmed_artist)`.
+    pub key: (String, String),
     /// Zero-based index of the first (kept) occurrence in the original input.
     pub first_occurrence_index: usize,
     /// All duplicate occurrences (does NOT include the first occurrence).
@@ -57,11 +59,11 @@ pub fn deduplicate_tracks(tracks: &[Track]) -> DeduplicateResult {
     use std::collections::HashMap;
 
     // key -> first_occurrence_index in original slice
-    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut seen: HashMap<(String, String), usize> = HashMap::new();
     let mut result_tracks: Vec<Track> = Vec::new();
     let mut duplicate_groups: Vec<DuplicateGroup> = Vec::new();
     // key -> index in duplicate_groups vec
-    let mut group_index: HashMap<String, usize> = HashMap::new();
+    let mut group_index: HashMap<(String, String), usize> = HashMap::new();
 
     for (i, track) in tracks.iter().enumerate() {
         let key = duplicate_key(&track.title, &track.artist);
@@ -118,7 +120,7 @@ mod tests {
     /// Expected duplicate group as serialised in the fixture.
     #[derive(Debug, Deserialize)]
     struct ExpectedGroup {
-        key: String,
+        key: (String, String),
         first_occurrence_id: String,
         first_occurrence_index: usize,
         duplicate_ids: Vec<String>,
@@ -171,10 +173,14 @@ mod tests {
     ///   - each expected duplicate ID appears in the group's occurrences
     #[test]
     fn fixture_all_cases() {
-        let fixture_json =
-            include_str!("../../../../test-fixtures/dedup_spec.json");
+        let fixture_path = format!(
+            "{}/test-fixtures/dedup_spec.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let fixture_json = std::fs::read_to_string(&fixture_path)
+            .expect("Failed to read dedup_spec.json fixture");
         let spec: FixtureSpec =
-            serde_json::from_str(fixture_json).expect("Failed to parse dedup_spec.json");
+            serde_json::from_str(&fixture_json).expect("Failed to parse dedup_spec.json");
 
         for case in &spec.test_cases {
             println!("\n[{}] {}", case.id, case.description);
@@ -206,7 +212,7 @@ mod tests {
                     .find(|g| g.key == expected.key)
                     .unwrap_or_else(|| {
                         panic!(
-                            "[{}] expected group with key '{}' not found in result",
+                            "[{}] expected group with key {:?} not found in result",
                             case.id, expected.key
                         )
                     });
@@ -215,7 +221,7 @@ mod tests {
                 assert_eq!(
                     actual.first_occurrence_index,
                     expected.first_occurrence_index,
-                    "[{}] first_occurrence_index mismatch for key '{}'",
+                    "[{}] first_occurrence_index mismatch for key {:?}",
                     case.id,
                     expected.key
                 );
@@ -232,7 +238,7 @@ mod tests {
                 assert_eq!(
                     actual.occurrences.len(),
                     expected.duplicate_ids.len(),
-                    "[{}] occurrence count mismatch for key '{}'",
+                    "[{}] occurrence count mismatch for key {:?}",
                     case.id,
                     expected.key
                 );
@@ -240,7 +246,7 @@ mod tests {
                 for dup_id in &expected.duplicate_ids {
                     assert!(
                         actual.occurrences.iter().any(|o| &o.track_id == dup_id),
-                        "[{}] expected duplicate id '{}' not found in occurrences for key '{}'",
+                        "[{}] expected duplicate id '{}' not found in occurrences for key {:?}",
                         case.id,
                         dup_id,
                         expected.key
@@ -257,18 +263,21 @@ mod tests {
     #[test]
     fn duplicate_key_empty_artist() {
         // Empty artist is a valid key component — must not panic or produce wrong key
-        let key = duplicate_key("Unknown Track", "");
-        assert_eq!(key, "unknown track|");
+        let (title_key, artist_key) = duplicate_key("Unknown Track", "");
+        assert_eq!(title_key, "unknown track");
+        assert_eq!(artist_key, "");
     }
 
     #[test]
-    fn duplicate_key_unicode_normalization() {
+    fn duplicate_key_lowercase_unicode() {
         // Rust's .to_lowercase() handles Unicode; ü stays ü, CJK is unchanged
-        let key = duplicate_key("Für Elise", "Beethoven");
-        assert_eq!(key, "für elise|beethoven");
+        let (title_key, artist_key) = duplicate_key("Für Elise", "Beethoven");
+        assert_eq!(title_key, "für elise");
+        assert_eq!(artist_key, "beethoven");
 
-        let key_cjk = duplicate_key("東京の夜", "坂本龍一");
-        assert_eq!(key_cjk, "東京の夜|坂本龍一");
+        let (title_key_cjk, artist_key_cjk) = duplicate_key("東京の夜", "坂本龍一");
+        assert_eq!(title_key_cjk, "東京の夜");
+        assert_eq!(artist_key_cjk, "坂本龍一");
     }
 
     #[test]
@@ -276,7 +285,7 @@ mod tests {
         let k1 = duplicate_key("  Song  ", "  Artist  ");
         let k2 = duplicate_key("\tSong\t", "\tArtist\t");
         assert_eq!(k1, k2, "space-trimmed and tab-trimmed keys must be equal");
-        assert_eq!(k1, "song|artist");
+        assert_eq!(k1, ("song".to_string(), "artist".to_string()));
     }
 
     #[test]
