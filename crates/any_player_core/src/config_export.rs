@@ -91,6 +91,11 @@ pub struct ExportPlaylist {
     pub track_count: i64,
     /// Logical type of the playlist (e.g., manual, union, smart).
     pub playlist_type: String,
+    /// Whether distinct/dedup mode is enabled for this playlist.
+    /// Uses `serde(default)` so old export payloads that omit this field
+    /// will deserialize safely with `false` — SYNC-02 backward compatibility.
+    #[serde(default)]
+    pub is_distinct: bool,
 }
 
 /// Exported representation of a single playlist track.
