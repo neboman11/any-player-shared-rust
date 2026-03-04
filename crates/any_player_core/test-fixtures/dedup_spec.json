@@ -1,0 +1,119 @@
+{
+  "test_cases": [
+    {
+      "id": "TC-01",
+      "description": "No duplicates: all unique title+artist combinations are kept",
+      "input": [
+        { "id": "a", "title": "Song A", "artist": "Artist 1" },
+        { "id": "b", "title": "Song B", "artist": "Artist 1" },
+        { "id": "c", "title": "Song A", "artist": "Artist 2" }
+      ],
+      "expected_deduped_count": 3,
+      "expected_duplicate_groups": []
+    },
+    {
+      "id": "TC-02",
+      "description": "Exact duplicate: second occurrence is dropped",
+      "input": [
+        { "id": "a", "title": "Song A", "artist": "Artist 1" },
+        { "id": "b", "title": "Song A", "artist": "Artist 1" }
+      ],
+      "expected_deduped_count": 1,
+      "expected_duplicate_groups": [
+        {
+          "key": ["song a", "artist 1"],
+          "first_occurrence_id": "a",
+          "first_occurrence_index": 0,
+          "duplicate_ids": ["b"]
+        }
+      ]
+    },
+    {
+      "id": "TC-03",
+      "description": "Case-insensitive dedup: uppercase/lowercase variants match",
+      "input": [
+        { "id": "a", "title": "Song A", "artist": "Artist 1" },
+        { "id": "b", "title": "SONG A", "artist": "ARTIST 1" }
+      ],
+      "expected_deduped_count": 1,
+      "expected_duplicate_groups": [
+        {
+          "key": ["song a", "artist 1"],
+          "first_occurrence_id": "a",
+          "first_occurrence_index": 0,
+          "duplicate_ids": ["b"]
+        }
+      ]
+    },
+    {
+      "id": "TC-04",
+      "description": "Whitespace-trimmed dedup: leading/trailing whitespace is ignored",
+      "input": [
+        { "id": "a", "title": "Song A", "artist": "Artist 1" },
+        { "id": "b", "title": "  Song A  ", "artist": "  Artist 1  " }
+      ],
+      "expected_deduped_count": 1,
+      "expected_duplicate_groups": [
+        {
+          "key": ["song a", "artist 1"],
+          "first_occurrence_id": "a",
+          "first_occurrence_index": 0,
+          "duplicate_ids": ["b"]
+        }
+      ]
+    },
+    {
+      "id": "TC-05",
+      "description": "Multiple duplicates of the same key: all extras are in one group",
+      "input": [
+        { "id": "a", "title": "Song A", "artist": "Artist 1" },
+        { "id": "b", "title": "Song A", "artist": "Artist 1" },
+        { "id": "c", "title": "Song A", "artist": "Artist 1" }
+      ],
+      "expected_deduped_count": 1,
+      "expected_duplicate_groups": [
+        {
+          "key": ["song a", "artist 1"],
+          "first_occurrence_id": "a",
+          "first_occurrence_index": 0,
+          "duplicate_ids": ["b", "c"]
+        }
+      ]
+    },
+    {
+      "id": "TC-06",
+      "description": "Multiple groups: independent duplicate clusters are tracked separately",
+      "input": [
+        { "id": "a", "title": "Song A", "artist": "Artist 1" },
+        { "id": "b", "title": "Song B", "artist": "Artist 2" },
+        { "id": "c", "title": "Song A", "artist": "Artist 1" },
+        { "id": "d", "title": "Song B", "artist": "Artist 2" }
+      ],
+      "expected_deduped_count": 2,
+      "expected_duplicate_groups": [
+        {
+          "key": ["song a", "artist 1"],
+          "first_occurrence_id": "a",
+          "first_occurrence_index": 0,
+          "duplicate_ids": ["c"]
+        },
+        {
+          "key": ["song b", "artist 2"],
+          "first_occurrence_id": "b",
+          "first_occurrence_index": 1,
+          "duplicate_ids": ["d"]
+        }
+      ]
+    },
+    {
+      "id": "TC-07",
+      "description": "Pipe character in title: no false collision between 'a|b'+'c' and 'a'+'b|c'",
+      "input": [
+        { "id": "a", "title": "a|b", "artist": "c" },
+        { "id": "b", "title": "a", "artist": "b|c" }
+      ],
+      "expected_deduped_count": 2,
+      "expected_duplicate_groups": []
+    }
+  ]
+}
