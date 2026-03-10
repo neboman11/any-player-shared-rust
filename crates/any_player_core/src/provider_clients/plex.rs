@@ -256,10 +256,10 @@ impl PlexApiClient {
             }
 
             // If the server reported a total, stop once we have collected all items
-            if let Some(total) = total_size {
-                if all_tracks.len() >= total {
-                    break;
-                }
+            if let Some(total) = total_size
+                && all_tracks.len() >= total
+            {
+                break;
             }
         }
 
