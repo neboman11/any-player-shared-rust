@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
+use tracing::debug;
 
 const PLEX_TYPE_PLAYLIST: &str = "15";
 const PLEX_MAX_PLAYLIST_PAGES: usize = 1000;
@@ -202,8 +203,11 @@ impl PlexApiClient {
         limit: usize,
     ) -> Result<(Vec<Track>, usize, Option<usize>), ProviderError> {
         let separator = if endpoint.contains('?') { '&' } else { '?' };
-        let paginated_endpoint =
-            format!("{}{}offset={}&limit={}", endpoint, separator, offset, limit);
+        // Use Plex's correct pagination params: containerStart and containerSize
+        let paginated_endpoint = format!(
+            "{}{}containerStart={}&containerSize={}",
+            endpoint, separator, offset, limit
+        );
 
         let response = self
             .client
@@ -237,32 +241,53 @@ impl PlexApiClient {
         base_url: &str,
         token: &str,
         endpoint: &str,
+        page_size: usize,
     ) -> Result<Vec<Track>, ProviderError> {
+        debug!("  get_all_tracks_from_endpoint: page_size={}", page_size);
         let mut all_tracks = Vec::new();
-        let page_size = 250;
         let mut offset = 0;
+        let mut page_count = 0;
+        let mut total_size: Option<usize> = None;
 
         for _ in 0..PLEX_MAX_PLAYLIST_PAGES {
-            let (page_tracks, raw_count, total_size) = self
+            page_count += 1;
+            debug!(
+                "    fetching page {}: offset={}, page_size={}",
+                page_count, offset, page_size
+            );
+            let (page_tracks, raw_count, page_total) = self
                 .get_tracks_from_endpoint(base_url, token, endpoint, offset, page_size)
                 .await?;
 
-            all_tracks.extend(page_tracks);
-            offset += page_size;
-
-            // A partial page means there are no more items to fetch
-            if raw_count < page_size {
-                break;
+            // Store the total_size from the first response
+            if total_size.is_none() {
+                total_size = page_total;
             }
 
+            debug!("    page {} returned {} tracks", page_count, raw_count);
+            all_tracks.extend(page_tracks);
+            offset += raw_count;
+
             // If the server reported a total, stop once we have collected all items
-            if let Some(total) = total_size
-                && all_tracks.len() >= total
-            {
+            if let Some(total) = total_size {
+                if all_tracks.len() >= total {
+                    debug!("    reached total_size={}, stopping pagination", total);
+                    break;
+                }
+            }
+
+            // If we got fewer tracks than we requested, there's nothing more to fetch
+            if raw_count == 0 {
+                debug!("    got 0 tracks, stopping pagination");
                 break;
             }
         }
 
+        debug!(
+            "  get_all_tracks_from_endpoint completed: {} tracks across {} pages",
+            all_tracks.len(),
+            page_count
+        );
         Ok(all_tracks)
     }
 
@@ -273,9 +298,12 @@ impl PlexApiClient {
         endpoint: &str,
         type_filter: Option<&str>,
     ) -> Result<Vec<Playlist>, ProviderError> {
+        let separator = if endpoint.contains('?') { '&' } else { '?' };
+        let limited_endpoint = format!("{}{}limit=50", endpoint, separator);
+
         let response = self
             .client
-            .get(Self::authed_url(base_url, token, endpoint))
+            .get(Self::authed_url(base_url, token, &limited_endpoint))
             .header("Accept", "application/json")
             .send()
             .await
@@ -353,6 +381,7 @@ impl ProviderApi for PlexApiClient {
         session: &ProviderAuthRequest,
         id: &str,
     ) -> Result<Playlist, ProviderError> {
+        debug!("PlexApiClient::get_playlist called: id={}", id);
         let base_url = Self::session_base_url(session)?;
         let token = Self::session_token(session)?;
 
@@ -368,10 +397,28 @@ impl ProviderApi for PlexApiClient {
             .pop()
             .ok_or_else(|| ProviderError(format!("Plex playlist not found: {}", id)))?;
 
-        // Fetch all tracks with pagination support
-        let tracks = self
-            .get_all_tracks_from_endpoint(&base_url, token, &format!("playlists/{}/items", id))
+        // Get page size from session, default to 300
+        let page_size = session
+            .get("page_size")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(300);
+
+        debug!("  page_size from session: {}", page_size);
+
+        // Fetch all tracks - the playlists endpoint doesn't respect pagination,
+        // so fetch with a large limit in a single request
+        debug!("  fetching all tracks for playlist {}", id);
+        let (tracks, raw_count, _) = self
+            .get_tracks_from_endpoint(
+                &base_url,
+                token,
+                &format!("playlists/{}/items", id),
+                0,
+                10000, // Large limit to get all tracks in one request
+            )
             .await?;
+        debug!("  fetched {} tracks", raw_count);
+        debug!("  fetched {} tracks total", tracks.len());
         playlist.track_count = tracks.len();
         playlist.tracks = tracks;
         Ok(playlist)
@@ -451,9 +498,15 @@ impl ProviderApi for PlexApiClient {
         let base_url = Self::session_base_url(session)?;
         let token = Self::session_token(session)?;
 
+        // Get page size from session, default to 300
+        let page_size = session
+            .get("page_size")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(300);
+
         // For small limits, avoid paginating through the entire recently played list.
         // The endpoint is ordered by recency, so a single page is sufficient.
-        let mut tracks = if limit <= 250 {
+        let mut tracks = if limit <= page_size {
             let (page_tracks, _, _) = self
                 .get_tracks_from_endpoint(
                     &base_url,
@@ -465,8 +518,13 @@ impl ProviderApi for PlexApiClient {
                 .await?;
             page_tracks
         } else {
-            self.get_all_tracks_from_endpoint(&base_url, token, "hubs/home/recentlyPlayed?type=10")
-                .await?
+            self.get_all_tracks_from_endpoint(
+                &base_url,
+                token,
+                "hubs/home/recentlyPlayed?type=10",
+                page_size,
+            )
+            .await?
         };
 
         if tracks.len() > limit {
