@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Builder, Runtime};
+use tokio::time::{Duration, timeout};
 use url::form_urlencoded;
 
 type SharedEngine = Arc<SpotifySessionEngine<AndroidSpotifyBackend>>;
@@ -990,10 +991,14 @@ async fn dispatch_provider_operation(
 ) -> Result<Value, String> {
     match operation {
         "validate_connection" => {
-            let validation = client
-                .validate_connection(session)
-                .await
-                .map_err(|error| error.0)?;
+            // Use 10-second timeout for connection validation
+            let validation = timeout(
+                Duration::from_secs(10),
+                client.validate_connection(session)
+            )
+            .await
+            .map_err(|_| "Connection validation timed out after 10 seconds. Provider server is not responding.".to_string())?
+            .map_err(|error| error.0)?;
             match validation {
                 ProviderConnectionCheck::Connected { username, metadata } => Ok(json!({
                     "connected": true,
@@ -1007,42 +1012,66 @@ async fn dispatch_provider_operation(
             }
         }
         "get_playlists" => {
-            let playlists = client
-                .get_playlists(session)
+            // Use 30-second timeout for playlist listing
+            let playlists = timeout(Duration::from_secs(30), client.get_playlists(session))
                 .await
+                .map_err(|_| {
+                    "Playlists fetch timed out after 30 seconds. Provider server is not responding."
+                        .to_string()
+                })?
                 .map_err(|error| error.0)?;
             Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
         }
         "get_playlist" => {
             let id = require_field(payload.id.clone(), "id")?;
-            let mut playlist = client
-                .get_playlist(session, &id)
+            // Use 60-second timeout for playlist fetch (especially important for Plex)
+            let result = timeout(Duration::from_secs(60), client.get_playlist(session, &id))
                 .await
+                .map_err(|_| {
+                    "Playlist fetch timed out after 60 seconds. Provider server is not responding."
+                        .to_string()
+                })?
                 .map_err(|error| error.0)?;
+            let mut playlist = result;
             playlist.tracks = page_slice(playlist.tracks, offset, limit);
             Ok(json!({ "playlist": json_value(playlist)? }))
         }
         "search_tracks" => {
             let query = require_field(payload.query.clone(), "query")?;
-            let tracks = client
-                .search_tracks(session, &query)
-                .await
-                .map_err(|error| error.0)?;
+            let tracks = timeout(
+                Duration::from_secs(30),
+                client.search_tracks(session, &query),
+            )
+            .await
+            .map_err(|_| {
+                "Track search timed out after 30 seconds. Provider server is not responding."
+                    .to_string()
+            })?
+            .map_err(|error| error.0)?;
             Ok(json!({ "tracks": json_value(page_slice(tracks, offset, limit))? }))
         }
         "search_playlists" => {
             let query = require_field(payload.query.clone(), "query")?;
-            let playlists = client
-                .search_playlists(session, &query)
-                .await
-                .map_err(|error| error.0)?;
+            let playlists = timeout(
+                Duration::from_secs(30),
+                client.search_playlists(session, &query),
+            )
+            .await
+            .map_err(|_| {
+                "Playlist search timed out after 30 seconds. Provider server is not responding."
+                    .to_string()
+            })?
+            .map_err(|error| error.0)?;
             Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
         }
         "get_recently_played" => {
-            let tracks = client
-                .get_recently_played(session, limit)
-                .await
-                .map_err(|error| error.0)?;
+            let tracks = timeout(
+                Duration::from_secs(30),
+                client.get_recently_played(session, limit)
+            )
+            .await
+            .map_err(|_| "Recently played fetch timed out after 30 seconds. Provider server is not responding.".to_string())?
+            .map_err(|error| error.0)?;
             Ok(json!({ "tracks": json_value(tracks)? }))
         }
         _ => Err(format!(
@@ -1063,7 +1092,9 @@ fn handle_provider_api_call(config_json: &str) -> String {
     let source = payload.source.trim().to_ascii_lowercase();
     let operation = payload.operation.trim().to_ascii_lowercase();
     let offset = payload.offset.unwrap_or(0);
-    let limit = payload.limit.unwrap_or(100).clamp(1, 500);
+    // Limit is now configurable via the request (e.g., from Android's configured page size).
+    // Enforce a reasonable maximum of 1000 to prevent excessive memory allocation.
+    let limit = payload.limit.unwrap_or(300).clamp(1, 1000);
     let session = ProviderAuthRequest::new(payload.session.clone());
 
     let result: Result<Value, String> = TOKIO_RUNTIME.block_on(async {
