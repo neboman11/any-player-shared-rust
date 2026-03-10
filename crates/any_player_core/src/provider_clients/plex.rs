@@ -299,7 +299,6 @@ impl PlexApiClient {
             .filter_map(|item| Self::playlist_from_metadata(base_url, token, item))
             .collect())
     }
-
 }
 
 #[async_trait]
@@ -466,12 +465,8 @@ impl ProviderApi for PlexApiClient {
                 .await?;
             page_tracks
         } else {
-            self.get_all_tracks_from_endpoint(
-                &base_url,
-                token,
-                "hubs/home/recentlyPlayed?type=10",
-            )
-            .await?
+            self.get_all_tracks_from_endpoint(&base_url, token, "hubs/home/recentlyPlayed?type=10")
+                .await?
         };
 
         if tracks.len() > limit {
