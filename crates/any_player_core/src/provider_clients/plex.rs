@@ -8,6 +8,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 
 const PLEX_TYPE_PLAYLIST: &str = "15";
+const PLEX_MAX_PLAYLIST_PAGES: usize = 1000;
 
 pub struct PlexApiClient {
     client: Client,
@@ -20,16 +21,11 @@ struct PlexResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct PlexMediaContainer {
     #[serde(default, rename = "Metadata")]
     metadata: Vec<PlexMetadata>,
     #[serde(default, rename = "totalSize")]
     total_size: Option<usize>,
-    #[serde(default)]
-    offset: Option<usize>,
-    #[serde(default, rename = "size")]
-    size: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,14 +193,14 @@ impl PlexApiClient {
         })
     }
 
-    pub async fn get_tracks_from_endpoint(
+    async fn get_tracks_from_endpoint(
         &self,
         base_url: &str,
         token: &str,
         endpoint: &str,
         offset: usize,
         limit: usize,
-    ) -> Result<Vec<Track>, ProviderError> {
+    ) -> Result<(Vec<Track>, usize, Option<usize>), ProviderError> {
         let separator = if endpoint.contains('?') { '&' } else { '?' };
         let paginated_endpoint =
             format!("{}{}offset={}&limit={}", endpoint, separator, offset, limit);
@@ -225,15 +221,18 @@ impl PlexApiClient {
         }
 
         let parsed = Self::parse_json_response::<PlexResponse>(response, "Plex track").await?;
-        Ok(parsed
-            .media_container
+        let container = parsed.media_container;
+        let total_size = container.total_size;
+        let raw_count = container.metadata.len();
+        let tracks = container
             .metadata
             .into_iter()
             .filter_map(|item| Self::track_from_metadata(base_url, token, item))
-            .collect())
+            .collect();
+        Ok((tracks, raw_count, total_size))
     }
 
-    pub async fn get_all_tracks_from_endpoint(
+    async fn get_all_tracks_from_endpoint(
         &self,
         base_url: &str,
         token: &str,
@@ -243,20 +242,25 @@ impl PlexApiClient {
         let page_size = 250;
         let mut offset = 0;
 
-        loop {
-            let page_tracks = self
+        for _ in 0..PLEX_MAX_PLAYLIST_PAGES {
+            let (page_tracks, raw_count, total_size) = self
                 .get_tracks_from_endpoint(base_url, token, endpoint, offset, page_size)
                 .await?;
 
-            let current_page_size = page_tracks.len();
             all_tracks.extend(page_tracks);
+            offset += page_size;
 
-            // If we got fewer tracks than requested, we've reached the end
-            if current_page_size < page_size {
+            // A partial page means there are no more items to fetch
+            if raw_count < page_size {
                 break;
             }
 
-            offset += page_size;
+            // If the server reported a total, stop once we have collected all items
+            if let Some(total) = total_size
+                && all_tracks.len() >= total
+            {
+                break;
+            }
         }
 
         Ok(all_tracks)
@@ -294,6 +298,22 @@ impl PlexApiClient {
             })
             .filter_map(|item| Self::playlist_from_metadata(base_url, token, item))
             .collect())
+    }
+
+    pub async fn get_recently_played(
+        &self,
+        session: &ProviderAuthRequest,
+        limit: usize,
+    ) -> Result<Vec<Track>, ProviderError> {
+        let base_url = Self::session_base_url(session)?;
+        let token = Self::session_token(session)?;
+        let mut tracks = self
+            .get_all_tracks_from_endpoint(&base_url, token, "hubs/home/recentlyPlayed?type=10")
+            .await?;
+        if tracks.len() > limit {
+            tracks.truncate(limit);
+        }
+        Ok(tracks)
     }
 }
 
@@ -380,7 +400,7 @@ impl ProviderApi for PlexApiClient {
     ) -> Result<Track, ProviderError> {
         let base_url = Self::session_base_url(session)?;
         let token = Self::session_token(session)?;
-        let tracks = self
+        let (tracks, _, _) = self
             .get_tracks_from_endpoint(&base_url, token, &format!("library/metadata/{}", id), 0, 1)
             .await?;
         tracks
@@ -398,14 +418,16 @@ impl ProviderApi for PlexApiClient {
         let token = Self::session_token(session)?;
         let encoded_query: String =
             url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
-        self.get_tracks_from_endpoint(
-            &base_url,
-            token,
-            &format!("search?query={}", encoded_query),
-            0,
-            50,
-        )
-        .await
+        let (tracks, _, _) = self
+            .get_tracks_from_endpoint(
+                &base_url,
+                token,
+                &format!("search?query={}", encoded_query),
+                0,
+                50,
+            )
+            .await?;
+        Ok(tracks)
     }
 
     async fn search_playlists(
