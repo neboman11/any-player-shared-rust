@@ -419,6 +419,7 @@ impl ProviderApi for JellyfinApiClient {
         let limit: usize = session
             .get("page_size")
             .and_then(|s| s.parse::<usize>().ok())
+            .map(|v| v.clamp(1, 1000))
             .unwrap_or(300);
         let mut start_index = 0usize;
 

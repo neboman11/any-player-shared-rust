@@ -1095,7 +1095,15 @@ fn handle_provider_api_call(config_json: &str) -> String {
     // Limit is now configurable via the request (e.g., from Android's configured page size).
     // Enforce a reasonable maximum of 1000 to prevent excessive memory allocation.
     let limit = payload.limit.unwrap_or(300).clamp(1, 1000);
-    let session = ProviderAuthRequest::new(payload.session.clone());
+
+    // Ensure provider pagination is aligned with the requested limit. If the caller has not
+    // explicitly provided a `page_size` in the session payload, derive it from `limit`.
+    let mut session_value = payload.session.clone();
+    if let Value::Object(ref mut map) = session_value {
+        map.entry("page_size".to_string())
+            .or_insert_with(|| Value::from(limit));
+    }
+    let session = ProviderAuthRequest::new(session_value);
 
     let result: Result<Value, String> = TOKIO_RUNTIME.block_on(async {
         match source.as_str() {
