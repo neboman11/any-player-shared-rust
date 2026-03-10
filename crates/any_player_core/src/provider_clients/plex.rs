@@ -299,6 +299,22 @@ impl PlexApiClient {
             .filter_map(|item| Self::playlist_from_metadata(base_url, token, item))
             .collect())
     }
+
+    pub async fn get_recently_played(
+        &self,
+        session: &ProviderAuthRequest,
+        limit: usize,
+    ) -> Result<Vec<Track>, ProviderError> {
+        let base_url = Self::session_base_url(session)?;
+        let token = Self::session_token(session)?;
+        let mut tracks = self
+            .get_all_tracks_from_endpoint(&base_url, token, "hubs/home/recentlyPlayed?type=10")
+            .await?;
+        if tracks.len() > limit {
+            tracks.truncate(limit);
+        }
+        Ok(tracks)
+    }
 }
 
 #[async_trait]
