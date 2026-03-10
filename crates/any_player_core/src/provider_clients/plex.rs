@@ -20,6 +20,7 @@ struct PlexResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct PlexMediaContainer {
     #[serde(default, rename = "Metadata")]
     metadata: Vec<PlexMetadata>,
@@ -206,7 +207,7 @@ impl PlexApiClient {
     ) -> Result<Vec<Track>, ProviderError> {
         let separator = if endpoint.contains('?') { '&' } else { '?' };
         let paginated_endpoint =
-            format!("{}{}offset={}limit={}", endpoint, separator, offset, limit);
+            format!("{}{}offset={}&limit={}", endpoint, separator, offset, limit);
 
         let response = self
             .client
