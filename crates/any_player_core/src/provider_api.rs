@@ -75,4 +75,15 @@ pub trait ProviderApi: Send + Sync {
         session: &ProviderAuthRequest,
         track_id: &str,
     ) -> Result<String, ProviderError>;
+
+    async fn get_recently_played(
+        &self,
+        session: &ProviderAuthRequest,
+        limit: usize,
+    ) -> Result<Vec<Track>, ProviderError> {
+        let _ = (session, limit);
+        Err(ProviderError(
+            "get_recently_played is not supported by this provider".to_string(),
+        ))
+    }
 }

@@ -300,21 +300,6 @@ impl PlexApiClient {
             .collect())
     }
 
-    pub async fn get_recently_played(
-        &self,
-        session: &ProviderAuthRequest,
-        limit: usize,
-    ) -> Result<Vec<Track>, ProviderError> {
-        let base_url = Self::session_base_url(session)?;
-        let token = Self::session_token(session)?;
-        let mut tracks = self
-            .get_all_tracks_from_endpoint(&base_url, token, "hubs/home/recentlyPlayed?type=10")
-            .await?;
-        if tracks.len() > limit {
-            tracks.truncate(limit);
-        }
-        Ok(tracks)
-    }
 }
 
 #[async_trait]
@@ -457,5 +442,41 @@ impl ProviderApi for PlexApiClient {
         track
             .url
             .ok_or_else(|| ProviderError("No stream URL available for Plex track".to_string()))
+    }
+
+    async fn get_recently_played(
+        &self,
+        session: &ProviderAuthRequest,
+        limit: usize,
+    ) -> Result<Vec<Track>, ProviderError> {
+        let base_url = Self::session_base_url(session)?;
+        let token = Self::session_token(session)?;
+
+        // For small limits, avoid paginating through the entire recently played list.
+        // The endpoint is ordered by recency, so a single page is sufficient.
+        let mut tracks = if limit <= 250 {
+            let (page_tracks, _, _) = self
+                .get_tracks_from_endpoint(
+                    &base_url,
+                    token,
+                    "hubs/home/recentlyPlayed?type=10",
+                    0,
+                    limit,
+                )
+                .await?;
+            page_tracks
+        } else {
+            self.get_all_tracks_from_endpoint(
+                &base_url,
+                token,
+                "hubs/home/recentlyPlayed?type=10",
+            )
+            .await?
+        };
+
+        if tracks.len() > limit {
+            tracks.truncate(limit);
+        }
+        Ok(tracks)
     }
 }
