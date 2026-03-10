@@ -1038,6 +1038,13 @@ async fn dispatch_provider_operation(
                 .map_err(|error| error.0)?;
             Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
         }
+        "get_recently_played" => {
+            let tracks = client
+                .get_recently_played(session, limit)
+                .await
+                .map_err(|error| error.0)?;
+            Ok(json!({ "tracks": json_value(tracks)? }))
+        }
         _ => Err(format!(
             "Unsupported provider operation for {}: {}",
             client.source(),
