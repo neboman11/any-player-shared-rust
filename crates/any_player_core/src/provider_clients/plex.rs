@@ -298,12 +298,17 @@ impl PlexApiClient {
         endpoint: &str,
         type_filter: Option<&str>,
     ) -> Result<Vec<Playlist>, ProviderError> {
-        let separator = if endpoint.contains('?') { '&' } else { '?' };
-        let limited_endpoint = format!("{}{}limit=50", endpoint, separator);
+        // Only append a limit parameter if one is not already present in the endpoint
+        let endpoint_with_limit = if endpoint.contains("limit=") {
+            endpoint.to_string()
+        } else {
+            let separator = if endpoint.contains('?') { '&' } else { '?' };
+            format!("{}{}limit=50", endpoint, separator)
+        };
 
         let response = self
             .client
-            .get(Self::authed_url(base_url, token, &limited_endpoint))
+            .get(Self::authed_url(base_url, token, &endpoint_with_limit))
             .header("Accept", "application/json")
             .send()
             .await
@@ -397,30 +402,29 @@ impl ProviderApi for PlexApiClient {
             .pop()
             .ok_or_else(|| ProviderError(format!("Plex playlist not found: {}", id)))?;
 
-        // Get page size from session, default to 300
+        // Get page size from session, default to 300, clamped to a reasonable range
         let page_size = session
             .get("page_size")
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(300);
+            .unwrap_or(300)
+            .clamp(1, 1000);
 
-        debug!("  page_size from session: {}", page_size);
+        debug!("  page_size from session (clamped): {}", page_size);
 
-        // Fetch all tracks - the playlists endpoint doesn't respect pagination,
-        // so fetch with a large limit in a single request
-        debug!("  fetching all tracks for playlist {}", id);
-        let (tracks, raw_count, _) = self
-            .get_tracks_from_endpoint(
+        // Fetch all tracks using pagination to avoid truncation and huge single responses
+        debug!("  fetching all tracks for playlist {} with pagination", id);
+        let all_tracks = self
+            .get_all_tracks_from_endpoint(
                 &base_url,
                 token,
                 &format!("playlists/{}/items", id),
-                0,
-                10000, // Large limit to get all tracks in one request
+                page_size,
             )
             .await?;
-        debug!("  fetched {} tracks", raw_count);
-        debug!("  fetched {} tracks total", tracks.len());
-        playlist.track_count = tracks.len();
-        playlist.tracks = tracks;
+
+        debug!("  fetched {} tracks total for playlist {}", all_tracks.len(), id);
+        playlist.track_count = all_tracks.len();
+        playlist.tracks = all_tracks;
         Ok(playlist)
     }
 
@@ -498,11 +502,12 @@ impl ProviderApi for PlexApiClient {
         let base_url = Self::session_base_url(session)?;
         let token = Self::session_token(session)?;
 
-        // Get page size from session, default to 300
+        // Get page size from session, default to 300, clamped to a sane range
         let page_size = session
             .get("page_size")
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(300);
+            .unwrap_or(300)
+            .clamp(1, 1000);
 
         // For small limits, avoid paginating through the entire recently played list.
         // The endpoint is ordered by recency, so a single page is sufficient.
