@@ -416,7 +416,11 @@ impl ProviderApi for JellyfinApiClient {
         let user = self.resolve_user(session, &base_url, api_key).await?;
 
         let mut all_tracks = Vec::new();
-        let limit = 300usize;
+        let limit: usize = session
+            .get("page_size")
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|v| v.clamp(1, 1000))
+            .unwrap_or(300);
         let mut start_index = 0usize;
 
         for _ in 0..JELLYFIN_MAX_PLAYLIST_PAGES {
