@@ -268,17 +268,20 @@ impl PlexApiClient {
             all_tracks.extend(page_tracks);
             offset += raw_count;
 
-            // If the server reported a total, stop once we have collected all items
+            // If the server reported a total, stop once we have fetched all raw items
             if let Some(total) = total_size
-                && all_tracks.len() >= total
+                && offset >= total
             {
                 debug!("    reached total_size={}, stopping pagination", total);
                 break;
             }
 
             // If we got fewer tracks than we requested, there's nothing more to fetch
-            if raw_count == 0 {
-                debug!("    got 0 tracks, stopping pagination");
+            if raw_count < page_size {
+                debug!(
+                    "    got {} tracks (less than requested {}), stopping pagination",
+                    raw_count, page_size
+                );
                 break;
             }
         }

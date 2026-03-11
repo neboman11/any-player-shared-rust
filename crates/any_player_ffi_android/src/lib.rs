@@ -1082,6 +1082,27 @@ async fn dispatch_provider_operation(
     }
 }
 
+/// Clamps `limit` to `1..=1000` (defaulting to 300 when absent) and ensures
+/// `page_size` is present in `session`, deriving it from `limit` when absent.
+/// This keeps provider pagination aligned with the requested limit.
+fn prepare_provider_call(
+    session: HashMap<String, String>,
+    limit: Option<usize>,
+) -> (HashMap<String, String>, usize) {
+    // Limit is now configurable via the request (e.g., from Android's configured page size).
+    // Enforce a reasonable maximum of 1000 to prevent excessive memory allocation.
+    let limit = limit.unwrap_or(300).clamp(1, 1000);
+
+    // If the caller has not explicitly provided a `page_size` in the session payload,
+    // derive it from `limit` so that provider pagination stays aligned.
+    let mut session = session;
+    session
+        .entry("page_size".to_string())
+        .or_insert_with(|| limit.to_string());
+
+    (session, limit)
+}
+
 fn handle_provider_api_call(config_json: &str) -> String {
     let payload =
         match parse_required_json::<ProviderApiCallPayload>(config_json, "provider_api_call") {
@@ -1092,17 +1113,9 @@ fn handle_provider_api_call(config_json: &str) -> String {
     let source = payload.source.trim().to_ascii_lowercase();
     let operation = payload.operation.trim().to_ascii_lowercase();
     let offset = payload.offset.unwrap_or(0);
-    // Limit is now configurable via the request (e.g., from Android's configured page size).
-    // Enforce a reasonable maximum of 1000 to prevent excessive memory allocation.
-    let limit = payload.limit.unwrap_or(300).clamp(1, 1000);
 
-    // Ensure provider pagination is aligned with the requested limit. If the caller has not
-    // explicitly provided a `page_size` in the session payload, derive it from `limit`.
-    let mut session_value = payload.session.clone();
-    session_value
-        .entry("page_size".to_string())
-        .or_insert_with(|| limit.to_string());
-    let session = ProviderAuthRequest::new(session_value);
+    let (session_map, limit) = prepare_provider_call(payload.session.clone(), payload.limit);
+    let session = ProviderAuthRequest::new(session_map);
 
     let result: Result<Value, String> = TOKIO_RUNTIME.block_on(async {
         match source.as_str() {
@@ -1687,5 +1700,43 @@ mod tests {
             payload["error"]["code"],
             Value::String("provider_api_error".to_string())
         );
+    }
+
+    #[test]
+    fn prepare_provider_call_defaults_limit_to_300_and_sets_page_size() {
+        let (session, limit) = prepare_provider_call(HashMap::new(), None);
+        assert_eq!(limit, 300);
+        assert_eq!(session["page_size"], "300");
+    }
+
+    #[test]
+    fn prepare_provider_call_uses_provided_limit_as_page_size() {
+        let (session, limit) = prepare_provider_call(HashMap::new(), Some(500));
+        assert_eq!(limit, 500);
+        assert_eq!(session["page_size"], "500");
+    }
+
+    #[test]
+    fn prepare_provider_call_clamps_limit_to_max_1000() {
+        let (session, limit) = prepare_provider_call(HashMap::new(), Some(2000));
+        assert_eq!(limit, 1000);
+        assert_eq!(session["page_size"], "1000");
+    }
+
+    #[test]
+    fn prepare_provider_call_clamps_limit_to_min_1() {
+        let (session, limit) = prepare_provider_call(HashMap::new(), Some(0));
+        assert_eq!(limit, 1);
+        assert_eq!(session["page_size"], "1");
+    }
+
+    #[test]
+    fn prepare_provider_call_preserves_existing_page_size_in_session() {
+        let mut existing_session = HashMap::new();
+        existing_session.insert("page_size".to_string(), "50".to_string());
+        let (session, limit) = prepare_provider_call(existing_session, Some(200));
+        assert_eq!(limit, 200);
+        // page_size from the caller's session must not be overridden
+        assert_eq!(session["page_size"], "50");
     }
 }
