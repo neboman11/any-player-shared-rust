@@ -1099,10 +1099,9 @@ fn handle_provider_api_call(config_json: &str) -> String {
     // Ensure provider pagination is aligned with the requested limit. If the caller has not
     // explicitly provided a `page_size` in the session payload, derive it from `limit`.
     let mut session_value = payload.session.clone();
-    if let Value::Object(ref mut map) = session_value {
-        map.entry("page_size".to_string())
-            .or_insert_with(|| Value::from(limit));
-    }
+    session_value
+        .entry("page_size".to_string())
+        .or_insert_with(|| limit.to_string());
     let session = ProviderAuthRequest::new(session_value);
 
     let result: Result<Value, String> = TOKIO_RUNTIME.block_on(async {

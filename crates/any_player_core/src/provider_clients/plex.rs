@@ -269,11 +269,11 @@ impl PlexApiClient {
             offset += raw_count;
 
             // If the server reported a total, stop once we have collected all items
-            if let Some(total) = total_size {
-                if all_tracks.len() >= total {
-                    debug!("    reached total_size={}, stopping pagination", total);
-                    break;
-                }
+            if let Some(total) = total_size
+                && all_tracks.len() >= total
+            {
+                debug!("    reached total_size={}, stopping pagination", total);
+                break;
             }
 
             // If we got fewer tracks than we requested, there's nothing more to fetch
@@ -422,7 +422,11 @@ impl ProviderApi for PlexApiClient {
             )
             .await?;
 
-        debug!("  fetched {} tracks total for playlist {}", all_tracks.len(), id);
+        debug!(
+            "  fetched {} tracks total for playlist {}",
+            all_tracks.len(),
+            id
+        );
         playlist.track_count = all_tracks.len();
         playlist.tracks = all_tracks;
         Ok(playlist)
