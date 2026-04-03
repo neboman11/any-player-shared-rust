@@ -593,18 +593,23 @@ fn handle_spotify_start_queue(config_json: &str) -> String {
         }
     };
 
-    // Disconnect any existing player first so startQueue always gets a clean
-    // slate. This also lets the connect() idempotency guard not block us here:
-    // concurrent ensure_player_connected() callers will wait, see is_connected()
-    // = true once our connect() finishes, and skip reconnection.
-    TOKIO_RUNTIME.block_on(PLAYER.disconnect());
+    // If the player is already connected, skip the expensive disconnect/reconnect
+    // cycle and just load the new track directly. This avoids a ~250ms+ gap where
+    // the old track's audio buffer continues playing while a brand-new session
+    // connects, which caused the "wrong audio on manual skip" bug.
+    let already_connected = TOKIO_RUNTIME.block_on(PLAYER.is_connected());
 
-    // Connect librespot (establishes a real Spotify session on this device).
-    if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.connect(&token_owned, &client_id_owned)) {
-        return error_response("librespot_connect_failed", error.message);
+    if !already_connected {
+        // Fresh connection: disconnect any stale state, then connect.
+        TOKIO_RUNTIME.block_on(PLAYER.disconnect());
+
+        if let Err(error) =
+            TOKIO_RUNTIME.block_on(PLAYER.connect(&token_owned, &client_id_owned))
+        {
+            return error_response("librespot_connect_failed", error.message);
+        }
     }
 
-    // Start decoding + playing audio directly via rodio — no Spotify Connect device needed.
     if let Err(error) =
         TOKIO_RUNTIME.block_on(PLAYER.start_queue(&normalized_track_ids, start_index))
     {
