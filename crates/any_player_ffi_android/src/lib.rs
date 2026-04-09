@@ -593,14 +593,14 @@ fn handle_spotify_start_queue(config_json: &str) -> String {
         }
     };
 
-    // If the player is already connected, skip the expensive disconnect/reconnect
+    // If the player is already healthy, skip the expensive disconnect/reconnect
     // cycle and just load the new track directly. This avoids a ~250ms+ gap where
     // the old track's audio buffer continues playing while a brand-new session
     // connects, which caused the "wrong audio on manual skip" bug.
-    let already_connected = TOKIO_RUNTIME.block_on(PLAYER.is_connected());
+    let already_healthy = TOKIO_RUNTIME.block_on(PLAYER.is_healthy());
 
-    if !already_connected {
-        // Fresh connection: disconnect any stale state, then connect.
+    if !already_healthy {
+        // Fresh connection (or stale session): tear down, then connect.
         TOKIO_RUNTIME.block_on(PLAYER.disconnect());
 
         if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.connect(&token_owned, &client_id_owned)) {
@@ -652,8 +652,14 @@ fn handle_spotify_start_queue(config_json: &str) -> String {
 /// transport commands (play, seek, etc.) have a loaded track to act on.
 /// Returns an error string if the connection cannot be established.
 fn ensure_player_connected() -> Result<(), String> {
-    if TOKIO_RUNTIME.block_on(PLAYER.is_connected()) {
+    if TOKIO_RUNTIME.block_on(PLAYER.is_healthy()) {
         return Ok(());
+    }
+
+    // If connected but unhealthy (stale session / dead player thread),
+    // tear down the old state so the reconnect below starts fresh.
+    if TOKIO_RUNTIME.block_on(PLAYER.is_connected()) {
+        TOKIO_RUNTIME.block_on(PLAYER.disconnect());
     }
 
     let (token, client_id, queue, index) = {
@@ -959,7 +965,7 @@ fn handle_spotify_snapshot() -> String {
     success_response(json!({
         "is_playing": snapshot.is_playing,
         "progress_ms": snapshot.progress_ms,
-        "end_of_track": snapshot.end_of_track,
+        "end_of_track_count": snapshot.end_of_track_count,
         "volume_percent": state.playback_volume_percent,
         "output_volume_percent": snapshot.volume_percent,
         "shuffle_enabled": state.playback_shuffle,

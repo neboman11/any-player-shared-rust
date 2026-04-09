@@ -25,10 +25,10 @@ struct PlaybackStats {
     /// `None` whenever playback stops or is paused.
     play_started_at: Option<std::time::Instant>,
     current_track_id: Option<String>,
-    /// Set to `true` by the `EndOfTrack` event and consumed (cleared to `false`)
-    /// by the next `snapshot()` call. Lets Kotlin detect natural track completion
-    /// and trigger auto-advance rather than treating it as a user pause.
-    end_of_track: bool,
+    /// Monotonically increasing counter incremented by each `EndOfTrack` event.
+    /// Kotlin reads the counter value via `snapshot()` and acknowledges it via
+    /// `acknowledge_end_of_track(n)` so the signal is never silently lost.
+    end_of_track_count: u64,
 }
 
 /// The state held by a running librespot player instance.
@@ -41,15 +41,8 @@ struct PlayerState {
     stats: Arc<StdMutex<PlaybackStats>>,
 }
 
-/// Thin wrapper around a librespot `Player` that handles auth, queue management,
-/// and transport commands. All real audio decoding and output is done by librespot
-/// + rodio; no Spotify Connect / Web API is used.
 pub struct LibrespotPlayer {
     inner: Mutex<Option<PlayerState>>,
-    /// Serialises concurrent `connect()` calls so only one session/player is
-    /// ever created at a time. Prevents the startup race where multiple
-    /// transport commands all call `ensure_player_connected()` in parallel
-    /// before the initial `startQueue` finishes.
     connecting: Mutex<()>,
 }
 
@@ -238,7 +231,10 @@ impl LibrespotPlayer {
                         log::info!("librespot: loading track={} at {}ms", track_id, position_ms);
                         if let Ok(mut s) = stats_ref.lock() {
                             s.progress_ms = position_ms as u64;
-                            s.end_of_track = false;
+                            // Reset the counter when a new track starts loading so
+                            // stale counts from the previous track don't trigger
+                            // false auto-advance signals.
+                            s.end_of_track_count = 0;
                         }
                     }
                     PlayerEvent::EndOfTrack { track_id, .. } => {
@@ -246,7 +242,7 @@ impl LibrespotPlayer {
                         if let Ok(mut s) = stats_ref.lock() {
                             s.is_playing = false;
                             s.play_started_at = None;
-                            s.end_of_track = true;
+                            s.end_of_track_count += 1;
                         }
                     }
                     PlayerEvent::Unavailable { track_id, .. } => {
@@ -277,6 +273,16 @@ impl LibrespotPlayer {
         });
 
         Ok(())
+    }
+
+    /// Returns true if there is an active connected session whose underlying
+    /// librespot `Session` and `Player` thread are both still alive.
+    pub async fn is_healthy(&self) -> bool {
+        let guard = self.inner.lock().await;
+        match guard.as_ref() {
+            None => false,
+            Some(state) => !state.session.is_invalid() && !state.player.is_invalid(),
+        }
     }
 
     /// Returns true if there is an active connected session.
@@ -323,7 +329,7 @@ impl LibrespotPlayer {
             s.is_playing = true;
             s.progress_ms = 0;
             s.play_started_at = Some(std::time::Instant::now());
-            s.end_of_track = false;
+            s.end_of_track_count = 0;
             s.current_track_id = Some(track_id.clone());
         }
 
@@ -387,14 +393,10 @@ impl LibrespotPlayer {
         match guard.as_ref() {
             None => PlayerSnapshot::default(),
             Some(state) => {
-                let (is_playing, progress_ms, end_of_track, current_track_id) = state
+                let (is_playing, progress_ms, end_of_track_count, current_track_id) = state
                     .stats
                     .lock()
-                    .map(|mut s| {
-                        // Compute live position by adding elapsed time since
-                        // the last play-start anchor. This makes progress_ms
-                        // advance continuously while the track is playing,
-                        // without any extra threads or librespot tick events.
+                    .map(|s| {
                         let live_ms = if s.is_playing {
                             s.play_started_at
                                 .map(|t| s.progress_ms + t.elapsed().as_millis() as u64)
@@ -402,13 +404,10 @@ impl LibrespotPlayer {
                         } else {
                             s.progress_ms
                         };
-                        // Consume the end_of_track flag so callers see it exactly once.
-                        let end_of_track = s.end_of_track;
-                        s.end_of_track = false;
                         (
                             s.is_playing,
                             live_ms,
-                            end_of_track,
+                            s.end_of_track_count,
                             s.current_track_id.clone(),
                         )
                     })
@@ -416,7 +415,7 @@ impl LibrespotPlayer {
                 PlayerSnapshot {
                     is_playing,
                     progress_ms,
-                    end_of_track,
+                    end_of_track_count,
                     volume_percent: state.volume_percent,
                     current_track_id,
                 }
@@ -443,9 +442,7 @@ impl Default for LibrespotPlayer {
 pub struct PlayerSnapshot {
     pub is_playing: bool,
     pub progress_ms: u64,
-    /// True exactly once per natural track completion (EndOfTrack event).
-    /// Consumed by `snapshot()` so callers see it on only one poll cycle.
-    pub end_of_track: bool,
+    pub end_of_track_count: u64,
     pub volume_percent: u8,
     pub current_track_id: Option<String>,
 }

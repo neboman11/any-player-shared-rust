@@ -186,10 +186,10 @@ impl PlexApiClient {
         action: &'static str,
     ) -> Result<T, ProviderError> {
         let body = response
-            .text()
+            .bytes()
             .await
             .map_err(|error| ProviderError(format!("Failed to read {} body: {}", action, error)))?;
-        serde_json::from_str::<T>(&body).map_err(|error| {
+        serde_json::from_slice::<T>(&body).map_err(|error| {
             ProviderError(format!("Failed to parse {} response: {}", action, error))
         })
     }
