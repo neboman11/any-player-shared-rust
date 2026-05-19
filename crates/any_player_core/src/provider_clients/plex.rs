@@ -142,10 +142,7 @@ impl PlexApiClient {
                 info!("Plex TCP probe: connecting to {}", addr);
                 match timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
                     Err(_) => {
-                        return Err(ProviderError(format!(
-                            "Failed to connect to Plex server at {}: timed out after 5s",
-                            addr
-                        )));
+                        last_connect_error = Some(format!("{}: timed out after 5s", addr));
                     }
                     Ok(Ok(_)) => return Ok(()),
                     Ok(Err(error)) => {
@@ -257,10 +254,10 @@ impl PlexApiClient {
             .await
             .map_err(|error| ProviderError(format!("Failed to read {} body: {}", action, error)))?;
 
-        // Log response size and a short excerpt for easier debugging on-device.
+        // Log response diagnostics only when debug logging is enabled.
         let len = body.len();
-        info!("Plex {} response length={} bytes", action, len);
         if tracing::enabled!(Level::DEBUG) {
+            debug!("Plex {} response length={} bytes", action, len);
             let excerpt = String::from_utf8_lossy(&body);
             let head: String = excerpt.chars().take(1024).collect();
             debug!("Plex {} response head: {}", action, head);
@@ -287,7 +284,7 @@ impl PlexApiClient {
         );
 
         info!(
-            "Plex get_tracks_from_endpoint: base_url='{}' endpoint='{}' offset={} limit={}'",
+            "Plex get_tracks_from_endpoint: base_url='{}' endpoint='{}' offset={} limit={}",
             base_url, paginated_endpoint, offset, limit
         );
 
