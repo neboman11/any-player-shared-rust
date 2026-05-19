@@ -331,10 +331,10 @@ impl ProviderApi for SpotifyApiClient {
             if all_tracks.len() >= requested_page_size {
                 break;
             }
-            if let Some(total) = total_opt {
-                if current_offset + parsed_count >= total {
-                    break;
-                }
+            if let Some(total) = total_opt
+                && current_offset + parsed_count >= total
+            {
+                break;
             }
 
             // Advance offset by the number of items returned (not parsed count),
