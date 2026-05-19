@@ -4,7 +4,9 @@ use any_player_core::audio_normalization::{
 };
 use any_player_core::provider_api::ProviderApi;
 use any_player_core::provider_api::ProviderConnectionCheck;
-use any_player_core::provider_clients::{jellyfin::JellyfinApiClient, plex::PlexApiClient};
+use any_player_core::provider_clients::{
+    jellyfin::JellyfinApiClient, plex::PlexApiClient, spotify::SpotifyApiClient,
+};
 use any_player_core::providers::ProviderAuthRequest;
 use any_player_spotify_engine::{
     LibrespotPlayer, SpotifyEngineError, SpotifySessionBackend, SpotifySessionConfig,
@@ -998,6 +1000,17 @@ async fn dispatch_provider_operation(
     offset: usize,
     limit: usize,
 ) -> Result<Value, String> {
+    // Log incoming provider dispatch for visibility (avoid printing auth tokens)
+    let session_keys: Vec<String> = session.as_map().keys().cloned().collect();
+    log::info!(
+        "dispatch_provider_operation: source={} operation={} id={:?} offset={} limit={} session_keys={:?}",
+        client.source(),
+        operation,
+        payload.id.clone().unwrap_or_default(),
+        offset,
+        limit,
+        session_keys
+    );
     match operation {
         "validate_connection" => {
             // Use 10-second timeout for connection validation
@@ -1033,12 +1046,15 @@ async fn dispatch_provider_operation(
         }
         "get_playlist" => {
             let id = require_field(payload.id.clone(), "id")?;
-            // Use 60-second timeout for playlist fetch (especially important for Plex)
-            let result = timeout(Duration::from_secs(60), client.get_playlist(session, &id))
+            // Use 120-second timeout for playlist fetch (especially important for Plex)
+            let timeout_secs = 120;
+            let result = timeout(Duration::from_secs(timeout_secs), client.get_playlist(session, &id))
                 .await
                 .map_err(|_| {
-                    "Playlist fetch timed out after 60 seconds. Provider server is not responding."
-                        .to_string()
+                    format!(
+                        "Playlist fetch timed out after {} seconds (id={}, offset={}, limit={}). Provider server is not responding.",
+                        timeout_secs, id, offset, limit
+                    )
                 })?
                 .map_err(|error| error.0)?;
             let mut playlist = result;
@@ -1135,6 +1151,11 @@ fn handle_provider_api_call(config_json: &str) -> String {
             }
             "plex" => {
                 let client = PlexApiClient::new();
+                dispatch_provider_operation(&client, &operation, &session, &payload, offset, limit)
+                    .await
+            }
+            "spotify" => {
+                let client = SpotifyApiClient::new();
                 dispatch_provider_operation(&client, &operation, &session, &payload, offset, limit)
                     .await
             }

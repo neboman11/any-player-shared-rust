@@ -267,42 +267,91 @@ impl ProviderApi for SpotifyApiClient {
         if playlist_id.is_empty() {
             return Err(ProviderError("Spotify playlist ID is required".to_string()));
         }
-
+        // Fetch playlist metadata first
         let metadata = self
             .execute_json(&format!("playlists/{}", playlist_id), token, &[])
             .await?;
-        let tracks_response = self
-            .execute_json(
-                &format!("playlists/{}/tracks", playlist_id),
-                token,
-                &[
-                    ("market".to_string(), "from_token".to_string()),
-                    ("limit".to_string(), "100".to_string()),
-                ],
-            )
-            .await?;
+
+        // Determine desired page size requested by the caller (provided via session)
+        let requested_page_size = session
+            .get("page_size")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(100usize)
+            .clamp(1, 1_000);
+
+        // Spotify limits per-request page size to 100. Fetch in pages until we
+        // have at least `requested_page_size` tracks or we reach the provider's total.
+        let mut all_tracks: Vec<Track> = Vec::new();
+        let mut current_offset: usize = 0;
+        let per_request_limit: usize = std::cmp::min(requested_page_size, 100);
+        let mut total_opt: Option<usize> = None;
+
+        loop {
+            let query = vec![
+                ("market".to_string(), "from_token".to_string()),
+                ("offset".to_string(), current_offset.to_string()),
+                ("limit".to_string(), per_request_limit.to_string()),
+            ];
+
+            let tracks_response = self
+                .execute_json(&format!("playlists/{}/tracks", playlist_id), token, &query)
+                .await?;
+
+            let items = tracks_response
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+
+            // Parse track entries (items may contain wrapper objects with "track")
+            let mut parsed_count = 0usize;
+            for item in &items {
+                if let Some(track_val) = item.get("track") {
+                    if let Some(track) = Self::parse_track(track_val) {
+                        all_tracks.push(track);
+                    }
+                } else if let Some(track) = Self::parse_track(item) {
+                    all_tracks.push(track);
+                }
+                parsed_count += 1;
+            }
+
+            // Capture total reported by Spotify on first page
+            if total_opt.is_none() {
+                total_opt = tracks_response
+                    .get("total")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize);
+            }
+
+            // Stop conditions
+            if parsed_count == 0 {
+                break;
+            }
+            if all_tracks.len() >= requested_page_size {
+                break;
+            }
+            if let Some(total) = total_opt {
+                if current_offset + parsed_count >= total {
+                    break;
+                }
+            }
+
+            // Advance offset by the number of items returned (not parsed count),
+            // this aligns with Spotify's paging semantics.
+            current_offset += parsed_count;
+        }
 
         let mut playlist = Self::parse_playlist(&metadata).ok_or_else(|| {
             ProviderError("Failed to parse Spotify playlist metadata".to_string())
         })?;
-        let tracks = tracks_response
-            .get("items")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.get("track"))
-                    .filter_map(Self::parse_track)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
 
-        if let Some(total) = tracks_response.get("total").and_then(Value::as_u64) {
-            playlist.track_count = total as usize;
+        if let Some(total) = total_opt {
+            playlist.track_count = total;
         } else {
-            playlist.track_count = tracks.len();
+            playlist.track_count = all_tracks.len();
         }
-        playlist.tracks = tracks;
+        playlist.tracks = all_tracks;
         Ok(playlist)
     }
 
