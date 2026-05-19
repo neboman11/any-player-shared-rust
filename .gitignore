@@ -1,2 +1,3 @@
 /target
+/crates/any_player_ffi_android/target
 /patches/librespot-core/Cargo.lock
