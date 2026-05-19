@@ -199,6 +199,7 @@ impl LibrespotPlayer {
                         if let Ok(mut s) = stats_ref.lock() {
                             s.is_playing = true;
                             s.progress_ms = position_ms as u64;
+                            s.current_track_id = Some(track_id.to_string());
                             // Record the wall-clock start so snapshot() can
                             // compute the live position without librespot ticks.
                             s.play_started_at = Some(std::time::Instant::now());
@@ -213,6 +214,7 @@ impl LibrespotPlayer {
                         if let Ok(mut s) = stats_ref.lock() {
                             s.is_playing = false;
                             s.progress_ms = position_ms as u64;
+                            s.current_track_id = Some(track_id.to_string());
                             s.play_started_at = None;
                         }
                     }
@@ -220,6 +222,7 @@ impl LibrespotPlayer {
                         log::info!("librespot: stopped track={}", track_id);
                         if let Ok(mut s) = stats_ref.lock() {
                             s.is_playing = false;
+                            s.current_track_id = Some(track_id.to_string());
                             s.play_started_at = None;
                         }
                     }
@@ -231,16 +234,14 @@ impl LibrespotPlayer {
                         log::info!("librespot: loading track={} at {}ms", track_id, position_ms);
                         if let Ok(mut s) = stats_ref.lock() {
                             s.progress_ms = position_ms as u64;
-                            // Reset the counter when a new track starts loading so
-                            // stale counts from the previous track don't trigger
-                            // false auto-advance signals.
-                            s.end_of_track_count = 0;
+                            s.current_track_id = Some(track_id.to_string());
                         }
                     }
                     PlayerEvent::EndOfTrack { track_id, .. } => {
                         log::info!("librespot: end of track track={}", track_id);
                         if let Ok(mut s) = stats_ref.lock() {
                             s.is_playing = false;
+                            s.current_track_id = Some(track_id.to_string());
                             s.play_started_at = None;
                             s.end_of_track_count += 1;
                         }
@@ -249,6 +250,7 @@ impl LibrespotPlayer {
                         log::warn!("librespot: track unavailable track={}", track_id);
                         if let Ok(mut s) = stats_ref.lock() {
                             s.is_playing = false;
+                            s.current_track_id = Some(track_id.to_string());
                             s.play_started_at = None;
                         }
                     }
@@ -329,7 +331,6 @@ impl LibrespotPlayer {
             s.is_playing = true;
             s.progress_ms = 0;
             s.play_started_at = Some(std::time::Instant::now());
-            s.end_of_track_count = 0;
             s.current_track_id = Some(track_id.clone());
         }
 

@@ -6,10 +6,14 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
-use tracing::debug;
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+use tracing::{Level, debug, info};
 
 const PLEX_TYPE_PLAYLIST: &str = "15";
 const PLEX_MAX_PLAYLIST_PAGES: usize = 1000;
+const PLEX_TCP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct PlexApiClient {
     client: Client,
@@ -78,9 +82,16 @@ impl Default for PlexApiClient {
 
 impl PlexApiClient {
     pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-        }
+        // Create a client with conservative connect/request timeouts so
+        // unreachable Plex servers fail fast and provide actionable errors
+        // to the caller instead of hanging until the overall dispatch
+        // timeout.
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(6))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self { client }
     }
 
     pub fn with_client(client: Client) -> Self {
@@ -103,6 +114,64 @@ impl PlexApiClient {
         } else {
             format!("{}/{}?X-Plex-Token={}", base_url, path, token)
         }
+    }
+
+    fn request_url(base_url: &str, path_with_query: &str) -> String {
+        let path = path_with_query.trim_start_matches('/');
+        format!("{}/{}", base_url, path)
+    }
+
+    async fn probe_tcp_connect(url: &str) -> Result<(), ProviderError> {
+        if let Ok(parsed) = url::Url::parse(url)
+            && let Some(host) = parsed.host_str()
+        {
+            let port = parsed.port_or_known_default().unwrap_or(80);
+            let addrs = tokio::net::lookup_host((host, port))
+                .await
+                .map_err(|error| {
+                    ProviderError(format!(
+                        "Failed to resolve Plex server host {}:{}: {}",
+                        host, port, error
+                    ))
+                })?;
+
+            let mut attempted = false;
+            let mut last_connect_error: Option<String> = None;
+
+            for addr in addrs {
+                attempted = true;
+                info!("Plex TCP probe: connecting to {}", addr);
+                match timeout(PLEX_TCP_PROBE_TIMEOUT, TcpStream::connect(addr)).await {
+                    Err(_) => {
+                        last_connect_error = Some(format!(
+                            "{}: timed out after {}s",
+                            addr,
+                            PLEX_TCP_PROBE_TIMEOUT.as_secs()
+                        ));
+                    }
+                    Ok(Ok(_)) => return Ok(()),
+                    Ok(Err(error)) => {
+                        last_connect_error = Some(format!("{}: {}", addr, error));
+                    }
+                }
+            }
+
+            if !attempted {
+                return Err(ProviderError(format!(
+                    "No network addresses found for Plex server host {}:{}",
+                    host, port
+                )));
+            }
+
+            if let Some(error) = last_connect_error {
+                return Err(ProviderError(format!(
+                    "Failed to connect to Plex server at {}:{} ({})",
+                    host, port, error
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     fn image_url_from_path(
@@ -189,6 +258,16 @@ impl PlexApiClient {
             .bytes()
             .await
             .map_err(|error| ProviderError(format!("Failed to read {} body: {}", action, error)))?;
+
+        // Log response diagnostics only when debug logging is enabled.
+        let len = body.len();
+        if tracing::enabled!(Level::DEBUG) {
+            debug!("Plex {} response length={} bytes", action, len);
+            let excerpt = String::from_utf8_lossy(&body);
+            let head: String = excerpt.chars().take(1024).collect();
+            debug!("Plex {} response head: {}", action, head);
+        }
+
         serde_json::from_slice::<T>(&body).map_err(|error| {
             ProviderError(format!("Failed to parse {} response: {}", action, error))
         })
@@ -209,13 +288,46 @@ impl PlexApiClient {
             endpoint, separator, offset, limit
         );
 
-        let response = self
+        info!(
+            "Plex get_tracks_from_endpoint: base_url='{}' endpoint='{}' offset={} limit={}",
+            base_url, paginated_endpoint, offset, limit
+        );
+
+        let url = Self::authed_url(base_url, token, &paginated_endpoint);
+        info!(
+            "Plex sending HTTP request: {}",
+            Self::request_url(base_url, &paginated_endpoint)
+        );
+
+        // Quick TCP probe to fail fast when the Plex server is unreachable
+        Self::probe_tcp_connect(&url).await?;
+
+        // Wrap the request in a tokio timeout so a stalled connect/read fails
+        // quickly instead of blocking until the overall provider dispatch
+        // timeout elapses.
+        let send_future = self
             .client
-            .get(Self::authed_url(base_url, token, &paginated_endpoint))
+            .get(&url)
             .header("Accept", "application/json")
-            .send()
+            .send();
+        let response = timeout(Duration::from_secs(20), send_future)
             .await
+            .map_err(|_| {
+                ProviderError(format!(
+                    "Plex HTTP request timed out after 20s (url={}, offset={}, limit={})",
+                    Self::request_url(base_url, &paginated_endpoint),
+                    offset,
+                    limit
+                ))
+            })?
             .map_err(|error| ProviderError(format!("Failed to fetch Plex tracks: {}", error)))?;
+
+        debug!(
+            "Plex get_tracks_from_endpoint response: offset={} limit={} status={}",
+            offset,
+            limit,
+            response.status()
+        );
 
         if !response.status().is_success() {
             return Err(ProviderError(format!(
@@ -233,6 +345,12 @@ impl PlexApiClient {
             .into_iter()
             .filter_map(|item| Self::track_from_metadata(base_url, token, item))
             .collect();
+
+        debug!(
+            "Plex parsed page: offset={} limit={} raw_count={} total_size={:?}",
+            offset, limit, raw_count, total_size
+        );
+
         Ok((tracks, raw_count, total_size))
     }
 
@@ -243,7 +361,7 @@ impl PlexApiClient {
         endpoint: &str,
         page_size: usize,
     ) -> Result<Vec<Track>, ProviderError> {
-        debug!("  get_all_tracks_from_endpoint: page_size={}", page_size);
+        info!("Plex get_all_tracks_from_endpoint: page_size={}", page_size);
         let mut all_tracks = Vec::new();
         let mut offset = 0;
         let mut page_count = 0;
@@ -252,7 +370,7 @@ impl PlexApiClient {
         for _ in 0..PLEX_MAX_PLAYLIST_PAGES {
             page_count += 1;
             debug!(
-                "    fetching page {}: offset={}, page_size={}",
+                "Plex fetching page {}: offset={} page_size={}",
                 page_count, offset, page_size
             );
             let (page_tracks, raw_count, page_total) = self
@@ -264,7 +382,7 @@ impl PlexApiClient {
                 total_size = page_total;
             }
 
-            debug!("    page {} returned {} tracks", page_count, raw_count);
+            debug!("Plex page {} returned {} tracks", page_count, raw_count);
             all_tracks.extend(page_tracks);
             offset += raw_count;
 
@@ -272,19 +390,19 @@ impl PlexApiClient {
             if let Some(total) = total_size
                 && all_tracks.len() >= total
             {
-                debug!("    reached total_size={}, stopping pagination", total);
+                debug!("Plex reached total_size={}, stopping pagination", total);
                 break;
             }
 
             // If we got no tracks at all, there's nothing more to fetch
             if raw_count == 0 {
-                debug!("    got 0 tracks, stopping pagination");
+                debug!("Plex got 0 tracks, stopping pagination");
                 break;
             }
         }
 
-        debug!(
-            "  get_all_tracks_from_endpoint completed: {} tracks across {} pages",
+        info!(
+            "Plex get_all_tracks_from_endpoint completed: {} tracks across {} pages",
             all_tracks.len(),
             page_count
         );
@@ -305,13 +423,28 @@ impl PlexApiClient {
             let separator = if endpoint.contains('?') { '&' } else { '?' };
             format!("{}{}limit=50", endpoint, separator)
         };
+        let url = Self::authed_url(base_url, token, &endpoint_with_limit);
+        info!(
+            "Plex sending HTTP request: {}",
+            Self::request_url(base_url, &endpoint_with_limit)
+        );
 
-        let response = self
+        // Quick TCP probe to fail fast when the Plex server is unreachable
+        Self::probe_tcp_connect(&url).await?;
+
+        let send_future = self
             .client
-            .get(Self::authed_url(base_url, token, &endpoint_with_limit))
+            .get(&url)
             .header("Accept", "application/json")
-            .send()
+            .send();
+        let response = timeout(Duration::from_secs(20), send_future)
             .await
+            .map_err(|_| {
+                ProviderError(format!(
+                    "Plex HTTP request timed out after 20s (url={})",
+                    Self::request_url(base_url, &endpoint_with_limit)
+                ))
+            })?
             .map_err(|error| ProviderError(format!("Failed to fetch Plex playlists: {}", error)))?;
 
         if !response.status().is_success() {
@@ -346,12 +479,34 @@ impl ProviderApi for PlexApiClient {
     ) -> Result<ProviderConnectionCheck, ProviderError> {
         let base_url = Self::session_base_url(session)?;
         let token = Self::session_token(session)?;
-        let response = self
+        let endpoint = "identity";
+        let url = Self::authed_url(&base_url, token, endpoint);
+        info!(
+            "Plex validate_connection: requesting {}",
+            Self::request_url(&base_url, endpoint)
+        );
+
+        // Quick TCP probe to fail fast when the Plex server is unreachable
+        if let Err(error) = Self::probe_tcp_connect(&url).await {
+            return Ok(ProviderConnectionCheck::Failed(format!(
+                "Plex connection test failed: {}",
+                error.0
+            )));
+        }
+
+        let send_future = self
             .client
-            .get(Self::authed_url(&base_url, token, "identity"))
+            .get(&url)
             .header("Accept", "application/json")
-            .send()
+            .send();
+        let response = timeout(Duration::from_secs(10), send_future)
             .await
+            .map_err(|_| {
+                ProviderError(
+                    "Connection validation timed out after 10 seconds. Provider server is not responding."
+                        .to_string(),
+                )
+            })?
             .map_err(|error| ProviderError(format!("Failed to connect to Plex: {}", error)));
 
         match response {
@@ -409,10 +564,13 @@ impl ProviderApi for PlexApiClient {
             .unwrap_or(300)
             .clamp(1, 1000);
 
-        debug!("  page_size from session (clamped): {}", page_size);
+        info!("Plex get_playlist: id={} page_size={}", id, page_size);
 
         // Fetch all tracks using pagination to avoid truncation and huge single responses
-        debug!("  fetching all tracks for playlist {} with pagination", id);
+        info!(
+            "Plex fetching all tracks for playlist {} with pagination",
+            id
+        );
         let all_tracks = self
             .get_all_tracks_from_endpoint(
                 &base_url,
