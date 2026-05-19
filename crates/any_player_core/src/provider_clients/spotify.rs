@@ -272,7 +272,7 @@ impl ProviderApi for SpotifyApiClient {
             .execute_json(&format!("playlists/{}", playlist_id), token, &[])
             .await?;
 
-        // Determine desired page size requested by the caller (provided via session)
+        // Determine per-request page size requested by the caller (provided via session)
         let requested_page_size = session
             .get("page_size")
             .and_then(|s| s.parse::<usize>().ok())
@@ -280,7 +280,7 @@ impl ProviderApi for SpotifyApiClient {
             .clamp(1, 1_000);
 
         // Spotify limits per-request page size to 100. Fetch in pages until we
-        // have at least `requested_page_size` tracks or we reach the provider's total.
+        // reach the provider's total (or receive an empty page).
         let mut all_tracks: Vec<Track> = Vec::new();
         let mut current_offset: usize = 0;
         let per_request_limit: usize = std::cmp::min(requested_page_size, 100);
@@ -326,9 +326,6 @@ impl ProviderApi for SpotifyApiClient {
 
             // Stop conditions
             if parsed_count == 0 {
-                break;
-            }
-            if all_tracks.len() >= requested_page_size {
                 break;
             }
             if let Some(total) = total_opt
