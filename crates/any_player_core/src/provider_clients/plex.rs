@@ -13,6 +13,7 @@ use tracing::{Level, debug, info};
 
 const PLEX_TYPE_PLAYLIST: &str = "15";
 const PLEX_MAX_PLAYLIST_PAGES: usize = 1000;
+const PLEX_TCP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct PlexApiClient {
     client: Client,
@@ -140,9 +141,13 @@ impl PlexApiClient {
             for addr in addrs {
                 attempted = true;
                 info!("Plex TCP probe: connecting to {}", addr);
-                match timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
+                match timeout(PLEX_TCP_PROBE_TIMEOUT, TcpStream::connect(addr)).await {
                     Err(_) => {
-                        last_connect_error = Some(format!("{}: timed out after 5s", addr));
+                        last_connect_error = Some(format!(
+                            "{}: timed out after {}s",
+                            addr,
+                            PLEX_TCP_PROBE_TIMEOUT.as_secs()
+                        ));
                     }
                     Ok(Ok(_)) => return Ok(()),
                     Ok(Err(error)) => {
