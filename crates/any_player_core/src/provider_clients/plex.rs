@@ -108,7 +108,7 @@ impl PlexApiClient {
         if scheme != "http" && scheme != "https" {
             return Err(ProviderError(format!(
                 "Plex URL must use http or https scheme, got: {}",
-                trimmed
+                scheme
             )));
         }
         Ok(trimmed.to_string())

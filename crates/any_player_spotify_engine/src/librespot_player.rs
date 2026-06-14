@@ -188,7 +188,7 @@ impl LibrespotPlayer {
         // Shared stats updated by the background event loop below.
         let stats: Arc<StdMutex<PlaybackStats>> = Arc::new(StdMutex::new(PlaybackStats::default()));
         let stats_ref = Arc::clone(&stats);
-        let player_ref = Arc::clone(&player);
+        let player_ref = Arc::downgrade(&player);
 
         // Drive the player event channel so it never fills up, and keep
         // playback stats in sync with what librespot actually reports.
@@ -277,7 +277,9 @@ impl LibrespotPlayer {
                                 "librespot: TimeToPreloadNextTrack — re-preloading {}",
                                 uri_str
                             );
-                            player_ref.preload(uri);
+                            if let Some(player) = player_ref.upgrade() {
+                                player.preload(uri);
+                            }
                         }
                     }
                     other => {

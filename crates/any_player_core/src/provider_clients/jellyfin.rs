@@ -119,7 +119,7 @@ impl JellyfinApiClient {
         if scheme != "http" && scheme != "https" {
             return Err(ProviderError(format!(
                 "Jellyfin URL must use http or https scheme, got: {}",
-                trimmed
+                scheme
             )));
         }
         Ok(trimmed.to_string())
