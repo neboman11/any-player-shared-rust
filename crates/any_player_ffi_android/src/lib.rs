@@ -633,7 +633,7 @@ fn handle_spotify_start_queue(config_json: &str) -> String {
         return error_response("librespot_set_volume_failed", error.message);
     }
 
-    let (track_count, preload_index, preload_track_id) = {
+    let (track_count, start_index, preload_track_id) = {
         let mut state = match lock_state() {
             Ok(state) => state,
             Err(error) => return error_response("bridge_state_error", error),
@@ -662,7 +662,7 @@ fn handle_spotify_start_queue(config_json: &str) -> String {
     success_response(json!({
         "started": true,
         "track_count": track_count,
-        "start_index": preload_index
+        "start_index": start_index
     }))
 }
 
