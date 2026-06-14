@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{Level, debug, info};
+use url::Url;
 
 const PLEX_TYPE_PLAYLIST: &str = "15";
 const PLEX_MAX_PLAYLIST_PAGES: usize = 1000;
@@ -101,7 +102,9 @@ impl PlexApiClient {
     fn session_base_url(session: &ProviderAuthRequest) -> Result<String, ProviderError> {
         let url = required_session_param(session, "Plex", "url")?;
         let trimmed = url.trim_end_matches('/');
-        let scheme = trimmed.split("://").next().unwrap_or("").to_lowercase();
+        let parsed = Url::parse(trimmed)
+            .map_err(|error| ProviderError(format!("Invalid Plex URL '{}': {}", trimmed, error)))?;
+        let scheme = parsed.scheme();
         if scheme != "http" && scheme != "https" {
             return Err(ProviderError(format!(
                 "Plex URL must use http or https scheme, got: {}",

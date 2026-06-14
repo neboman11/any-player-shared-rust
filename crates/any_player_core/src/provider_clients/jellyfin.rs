@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::HashMap;
+use url::Url;
 
 const JELLYFIN_STREAM_CONTAINERS: &str = "opus,mp3,aac,m4a,flac,webma,webm,wav,ogg";
 const JELLYFIN_STREAM_CODECS: &str = "aac,mp3,vorbis,opus";
@@ -111,7 +112,10 @@ impl JellyfinApiClient {
     fn base_url(session: &ProviderAuthRequest) -> Result<String, ProviderError> {
         let raw_url = required_session_param(session, "Jellyfin", "url")?;
         let trimmed = raw_url.trim_end_matches('/');
-        let scheme = trimmed.split("://").next().unwrap_or("").to_lowercase();
+        let parsed = Url::parse(trimmed).map_err(|error| {
+            ProviderError(format!("Invalid Jellyfin URL '{}': {}", trimmed, error))
+        })?;
+        let scheme = parsed.scheme();
         if scheme != "http" && scheme != "https" {
             return Err(ProviderError(format!(
                 "Jellyfin URL must use http or https scheme, got: {}",
