@@ -110,7 +110,15 @@ impl JellyfinApiClient {
 
     fn base_url(session: &ProviderAuthRequest) -> Result<String, ProviderError> {
         let raw_url = required_session_param(session, "Jellyfin", "url")?;
-        Ok(raw_url.trim_end_matches('/').to_string())
+        let trimmed = raw_url.trim_end_matches('/');
+        let scheme = trimmed.split("://").next().unwrap_or("").to_lowercase();
+        if scheme != "http" && scheme != "https" {
+            return Err(ProviderError(format!(
+                "Jellyfin URL must use http or https scheme, got: {}",
+                trimmed
+            )));
+        }
+        Ok(trimmed.to_string())
     }
 
     fn api_key(session: &ProviderAuthRequest) -> Result<&str, ProviderError> {
@@ -197,14 +205,14 @@ impl JellyfinApiClient {
         Ok(users[0].clone())
     }
 
-    fn get_image_url(base_url: &str, api_key: &str, item: &JellyfinItem) -> Option<String> {
+    fn get_image_url(base_url: &str, _api_key: &str, item: &JellyfinItem) -> Option<String> {
         if item.item_type == "Audio"
             && let (Some(album_id), Some(album_tag)) =
                 (&item.album_id, &item.album_primary_image_tag)
         {
             return Some(format!(
-                "{}/Items/{}/Images/Primary?tag={}&api_key={}",
-                base_url, album_id, album_tag, api_key
+                "{}/Items/{}/Images/Primary?tag={}",
+                base_url, album_id, album_tag
             ));
         }
 
@@ -212,8 +220,8 @@ impl JellyfinApiClient {
             && let Some(primary_tag) = tags.get("Primary").and_then(Value::as_str)
         {
             return Some(format!(
-                "{}/Items/{}/Images/Primary?tag={}&api_key={}",
-                base_url, item.id, primary_tag, api_key
+                "{}/Items/{}/Images/Primary?tag={}",
+                base_url, item.id, primary_tag
             ));
         }
 

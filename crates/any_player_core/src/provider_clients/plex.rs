@@ -100,7 +100,15 @@ impl PlexApiClient {
 
     fn session_base_url(session: &ProviderAuthRequest) -> Result<String, ProviderError> {
         let url = required_session_param(session, "Plex", "url")?;
-        Ok(url.trim_end_matches('/').to_string())
+        let trimmed = url.trim_end_matches('/');
+        let scheme = trimmed.split("://").next().unwrap_or("").to_lowercase();
+        if scheme != "http" && scheme != "https" {
+            return Err(ProviderError(format!(
+                "Plex URL must use http or https scheme, got: {}",
+                trimmed
+            )));
+        }
+        Ok(trimmed.to_string())
     }
 
     fn session_token(session: &ProviderAuthRequest) -> Result<&str, ProviderError> {
