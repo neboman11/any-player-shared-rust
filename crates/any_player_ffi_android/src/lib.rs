@@ -710,10 +710,10 @@ fn ensure_player_connected() -> Result<(), String> {
 /// Failures are logged and silently swallowed — a missed preload degrades to
 /// a normal stream start on track change, but does not break playback.
 fn try_preload_next_spotify_track(queue: &[String], current_index: usize) {
-    if let Some(next_id) = queue.get(current_index + 1) {
-        if let Err(e) = TOKIO_RUNTIME.block_on(PLAYER.preload(next_id)) {
-            log::debug!("spotify preload next track skipped: {}", e.message);
-        }
+    if let Some(next_id) = queue.get(current_index + 1)
+        && let Err(e) = TOKIO_RUNTIME.block_on(PLAYER.preload(next_id))
+    {
+        log::debug!("spotify preload next track skipped: {}", e.message);
     }
 }
 

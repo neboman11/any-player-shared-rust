@@ -270,14 +270,14 @@ impl LibrespotPlayer {
                             .lock()
                             .ok()
                             .and_then(|s| s.next_preload_uri.clone());
-                        if let Some(uri_str) = next_uri {
-                            if let Ok(uri) = SpotifyUri::from_uri(&uri_str) {
-                                log::debug!(
-                                    "librespot: TimeToPreloadNextTrack — re-preloading {}",
-                                    uri_str
-                                );
-                                player_ref.preload(uri);
-                            }
+                        if let Some(uri_str) = next_uri
+                            && let Ok(uri) = SpotifyUri::from_uri(&uri_str)
+                        {
+                            log::debug!(
+                                "librespot: TimeToPreloadNextTrack — re-preloading {}",
+                                uri_str
+                            );
+                            player_ref.preload(uri);
                         }
                     }
                     other => {
