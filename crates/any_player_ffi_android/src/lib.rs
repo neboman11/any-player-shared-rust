@@ -633,19 +633,36 @@ fn handle_spotify_start_queue(config_json: &str) -> String {
         return error_response("librespot_set_volume_failed", error.message);
     }
 
-    let mut state = match lock_state() {
-        Ok(state) => state,
-        Err(error) => return error_response("bridge_state_error", error),
+    let (track_count, start_index, preload_track_id) = {
+        let mut state = match lock_state() {
+            Ok(state) => state,
+            Err(error) => return error_response("bridge_state_error", error),
+        };
+        // Persist the token so later transport commands can reconnect transparently.
+        state.playback_access_token = Some(token_owned);
+        state.playback_queue = normalized_track_ids;
+        state.playback_index = start_index;
+        let track_count = state.playback_queue.len();
+        let next_preload_index = if state.playback_index + 1 < track_count {
+            Some(state.playback_index + 1)
+        } else if state.playback_repeat_mode == RepeatModeState::All && track_count > 0 {
+            Some(0)
+        } else {
+            None
+        };
+        let preload_track_id = next_preload_index
+            .and_then(|index| state.playback_queue.get(index))
+            .cloned();
+        (track_count, state.playback_index, preload_track_id)
     };
-    // Persist the token so later transport commands can reconnect transparently.
-    state.playback_access_token = Some(token_owned);
-    state.playback_queue = normalized_track_ids;
-    state.playback_index = start_index;
+
+    // Proactively preload the next track while the current one starts playing.
+    try_preload_spotify_track_id(preload_track_id.as_deref());
 
     success_response(json!({
         "started": true,
-        "track_count": state.playback_queue.len(),
-        "start_index": state.playback_index
+        "track_count": track_count,
+        "start_index": start_index
     }))
 }
 
@@ -664,7 +681,7 @@ fn ensure_player_connected() -> Result<(), String> {
         TOKIO_RUNTIME.block_on(PLAYER.disconnect());
     }
 
-    let (token, client_id, queue, index) = {
+    let (token, client_id, queue, index, repeat_mode) = {
         let state = lock_state()?;
         let token = state.playback_access_token.clone().ok_or_else(|| {
             "librespot_not_connected: No stored access token — call startQueue first".to_string()
@@ -677,6 +694,7 @@ fn ensure_player_connected() -> Result<(), String> {
             client_id,
             state.playback_queue.clone(),
             state.playback_index,
+            state.playback_repeat_mode,
         )
     };
 
@@ -689,9 +707,40 @@ fn ensure_player_connected() -> Result<(), String> {
         TOKIO_RUNTIME
             .block_on(PLAYER.start_queue(&queue, index))
             .map_err(|e| e.message)?;
+
+        try_preload_next_spotify_track(&queue, index, repeat_mode);
     }
 
     Ok(())
+}
+
+/// Best-effort preload of the track after `current_index` in `queue`.
+/// Failures are logged and silently swallowed — a missed preload degrades to
+/// a normal stream start on track change, but does not break playback.
+fn try_preload_next_spotify_track(
+    queue: &[String],
+    current_index: usize,
+    repeat_mode: RepeatModeState,
+) {
+    let next_preload_index = if current_index + 1 < queue.len() {
+        Some(current_index + 1)
+    } else if repeat_mode == RepeatModeState::All && !queue.is_empty() {
+        Some(0)
+    } else {
+        None
+    };
+
+    try_preload_spotify_track_id(
+        next_preload_index.and_then(|index| queue.get(index).map(String::as_str)),
+    );
+}
+
+fn try_preload_spotify_track_id(next_track_id: Option<&str>) {
+    if let Some(next_id) = next_track_id
+        && let Err(e) = TOKIO_RUNTIME.block_on(PLAYER.preload(next_id))
+    {
+        log::debug!("spotify preload next track skipped: {}", e.message);
+    }
 }
 
 fn run_connected_player_command<F>(success_payload: serde_json::Value, command: F) -> String
@@ -730,12 +779,13 @@ fn handle_spotify_next() -> String {
         return error_response("librespot_empty_queue", "No playback queue loaded");
     }
 
-    let next_index = if state.playback_repeat_mode == RepeatModeState::One {
+    let repeat_mode = state.playback_repeat_mode;
+    let next_index = if repeat_mode == RepeatModeState::One {
         // Replay the current track.
         state.playback_index
     } else if state.playback_index + 1 < state.playback_queue.len() {
         state.playback_index + 1
-    } else if state.playback_repeat_mode == RepeatModeState::All {
+    } else if repeat_mode == RepeatModeState::All {
         0
     } else {
         return success_response(json!({ "ok": true, "end_of_queue": true }));
@@ -751,6 +801,8 @@ fn handle_spotify_next() -> String {
     if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.start_queue(&track_ids, next_index)) {
         return error_response("librespot_next_failed", error.message);
     }
+
+    try_preload_next_spotify_track(&track_ids, next_index, repeat_mode);
 
     success_response(json!({ "ok": true }))
 }
@@ -772,6 +824,7 @@ fn handle_spotify_previous() -> String {
     } else {
         0
     };
+    let repeat_mode = state.playback_repeat_mode;
 
     let track_ids = state.playback_queue.clone();
     state.playback_index = prev_index;
@@ -783,6 +836,8 @@ fn handle_spotify_previous() -> String {
     if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.start_queue(&track_ids, prev_index)) {
         return error_response("librespot_previous_failed", error.message);
     }
+
+    try_preload_next_spotify_track(&track_ids, prev_index, repeat_mode);
 
     success_response(json!({ "ok": true }))
 }

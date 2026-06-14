@@ -29,6 +29,10 @@ struct PlaybackStats {
     /// Kotlin reads the counter value via `snapshot()` and acknowledges it via
     /// `acknowledge_end_of_track(n)` so the signal is never silently lost.
     end_of_track_count: u64,
+    /// Full Spotify URI of the next track to preload. Set when a preload is
+    /// requested; read by the `TimeToPreloadNextTrack` event handler to
+    /// re-trigger if the earlier pre-fetch window was missed.
+    next_preload_uri: Option<String>,
 }
 
 /// The state held by a running librespot player instance.
@@ -184,6 +188,7 @@ impl LibrespotPlayer {
         // Shared stats updated by the background event loop below.
         let stats: Arc<StdMutex<PlaybackStats>> = Arc::new(StdMutex::new(PlaybackStats::default()));
         let stats_ref = Arc::clone(&stats);
+        let player_ref = Arc::downgrade(&player);
 
         // Drive the player event channel so it never fills up, and keep
         // playback stats in sync with what librespot actually reports.
@@ -256,6 +261,26 @@ impl LibrespotPlayer {
                     }
                     PlayerEvent::VolumeChanged { volume } => {
                         log::debug!("librespot: volume changed to {}", volume);
+                    }
+                    PlayerEvent::TimeToPreloadNextTrack { .. } => {
+                        // Re-trigger preload when librespot signals the window is open.
+                        // This handles the case where our proactive preload was too early
+                        // and the buffered data was evicted before playback reached it.
+                        let next_uri = stats_ref
+                            .lock()
+                            .ok()
+                            .and_then(|s| s.next_preload_uri.clone());
+                        if let Some(uri_str) = next_uri
+                            && let Ok(uri) = SpotifyUri::from_uri(&uri_str)
+                        {
+                            log::debug!(
+                                "librespot: TimeToPreloadNextTrack — re-preloading {}",
+                                uri_str
+                            );
+                            if let Some(player) = player_ref.upgrade() {
+                                player.preload(uri);
+                            }
+                        }
                     }
                     other => {
                         log::debug!("librespot: event {:?}", other);
@@ -334,6 +359,36 @@ impl LibrespotPlayer {
             s.current_track_id = Some(track_id.clone());
         }
 
+        Ok(())
+    }
+
+    /// Pre-fetch and decode the given track without starting playback.
+    /// When the current track is about to end and `load()` is called for this
+    /// track, librespot reuses the pre-fetched decoder data for a gapless transition.
+    /// Safe to call multiple times; idempotent if the same track is already preloading.
+    pub async fn preload(&self, track_id: &str) -> Result<(), SpotifyEngineError> {
+        let mut guard = self.inner.lock().await;
+        let state = guard.as_mut().ok_or_else(not_connected_error)?;
+
+        let uri_str = if track_id.starts_with("spotify:") {
+            track_id.to_string()
+        } else {
+            format!("spotify:track:{}", track_id)
+        };
+
+        let spotify_uri = SpotifyUri::from_uri(&uri_str).map_err(|_| {
+            SpotifyEngineError::new(
+                "librespot_invalid_track_id",
+                format!("Invalid Spotify track URI for preload: {}", uri_str),
+            )
+        })?;
+
+        if let Ok(mut s) = state.stats.lock() {
+            s.next_preload_uri = Some(uri_str.clone());
+        }
+
+        log::debug!("librespot: preloading {}", uri_str);
+        state.player.preload(spotify_uri);
         Ok(())
     }
 
