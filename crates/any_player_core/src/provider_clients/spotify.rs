@@ -102,11 +102,15 @@ impl SpotifyApiClient {
         let artist = value
             .get("artists")
             .and_then(Value::as_array)
-            .and_then(|artists| artists.first())
-            .and_then(|artist| artist.get("name"))
-            .and_then(Value::as_str)
-            .unwrap_or("Unknown Artist")
-            .to_string();
+            .map(|artists| {
+                artists
+                    .iter()
+                    .filter_map(|artist| artist.get("name").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|joined| !joined.is_empty())
+            .unwrap_or_else(|| "Unknown Artist".to_string());
 
         let album = value
             .get("album")

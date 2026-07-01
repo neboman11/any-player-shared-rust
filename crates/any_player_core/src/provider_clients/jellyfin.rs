@@ -291,8 +291,8 @@ impl JellyfinApiClient {
         let artist = item
             .artists
             .as_ref()
-            .and_then(|artists| artists.first())
-            .cloned()
+            .filter(|artists| !artists.is_empty())
+            .map(|artists| artists.join(", "))
             .unwrap_or_else(|| "Unknown Artist".to_string());
         let album = item
             .album
