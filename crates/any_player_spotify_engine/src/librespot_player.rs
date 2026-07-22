@@ -340,11 +340,12 @@ impl LibrespotPlayer {
     /// real `PlayerEvent` for longer than `PLAYING_CONFIRMATION_TIMEOUT` —
     /// the signature of a session whose socket died silently in the background.
     fn playback_confirmation_stalled(stats: &Arc<StdMutex<PlaybackStats>>) -> bool {
-        stats
-            .lock()
-            .ok()
-            .and_then(|s| s.awaiting_playing_confirmation_since)
-            .is_some_and(|since| since.elapsed() > PLAYING_CONFIRMATION_TIMEOUT)
+        match stats.lock() {
+            Ok(s) => s
+                .awaiting_playing_confirmation_since
+                .is_some_and(|since| since.elapsed() > PLAYING_CONFIRMATION_TIMEOUT),
+            Err(_) => true,
+        }
     }
 
     /// Returns true if there is an active connected session.
@@ -556,4 +557,36 @@ fn not_connected_error() -> SpotifyEngineError {
         "librespot_not_connected",
         "Player is not connected. Call connect() first.",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_confirmation_stalled_is_true_when_stats_lock_is_poisoned() {
+        let stats = Arc::new(StdMutex::new(PlaybackStats::default()));
+        let poisoned_stats = Arc::clone(&stats);
+
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned_stats.lock().unwrap();
+            panic!("poison playback stats mutex");
+        });
+
+        assert!(LibrespotPlayer::playback_confirmation_stalled(&stats));
+    }
+
+    #[test]
+    fn playback_confirmation_stalled_is_true_after_timeout() {
+        let stats = Arc::new(StdMutex::new(PlaybackStats {
+            awaiting_playing_confirmation_since: Some(
+                std::time::Instant::now()
+                    - PLAYING_CONFIRMATION_TIMEOUT
+                    - std::time::Duration::from_millis(1),
+            ),
+            ..PlaybackStats::default()
+        }));
+
+        assert!(LibrespotPlayer::playback_confirmation_stalled(&stats));
+    }
 }
