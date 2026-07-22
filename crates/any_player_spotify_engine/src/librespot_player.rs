@@ -33,7 +33,22 @@ struct PlaybackStats {
     /// requested; read by the `TimeToPreloadNextTrack` event handler to
     /// re-trigger if the earlier pre-fetch window was missed.
     next_preload_uri: Option<String>,
+    /// Set the instant `play()`/`start_queue()` optimistically marks playback
+    /// as active; cleared the moment any real `PlayerEvent` arrives (proof the
+    /// event loop — and therefore the underlying session — is still alive).
+    /// If this stays set past `PLAYING_CONFIRMATION_TIMEOUT`, the session's
+    /// socket likely died silently in the background (Doze/network loss)
+    /// while librespot's `Session`/`Player` objects remained technically
+    /// valid, so `is_healthy()`/`snapshot()` treat it as dead. Without this,
+    /// such a session reports healthy and "playing" forever with no audio,
+    /// and previously required a force-stop to recover.
+    awaiting_playing_confirmation_since: Option<std::time::Instant>,
 }
+
+/// How long to wait for a real `PlayerEvent` to confirm a `play()`/`start_queue()`
+/// call before treating the session as silently stalled. Generous enough to
+/// cover legitimate slow network starts.
+const PLAYING_CONFIRMATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// The state held by a running librespot player instance.
 struct PlayerState {
@@ -194,6 +209,11 @@ impl LibrespotPlayer {
         // playback stats in sync with what librespot actually reports.
         tokio::spawn(async move {
             while let Some(event) = event_channel.recv().await {
+                // Any real event proves the event loop (and the session behind
+                // it) is still alive, regardless of which event it is.
+                if let Ok(mut s) = stats_ref.lock() {
+                    s.awaiting_playing_confirmation_since = None;
+                }
                 match event {
                     PlayerEvent::Playing {
                         position_ms,
@@ -308,7 +328,23 @@ impl LibrespotPlayer {
         let guard = self.inner.lock().await;
         match guard.as_ref() {
             None => false,
-            Some(state) => !state.session.is_invalid() && !state.player.is_invalid(),
+            Some(state) => {
+                !state.session.is_invalid()
+                    && !state.player.is_invalid()
+                    && !Self::playback_confirmation_stalled(&state.stats)
+            }
+        }
+    }
+
+    /// True when a `play()`/`start_queue()` call has gone unconfirmed by any
+    /// real `PlayerEvent` for longer than `PLAYING_CONFIRMATION_TIMEOUT` —
+    /// the signature of a session whose socket died silently in the background.
+    fn playback_confirmation_stalled(stats: &Arc<StdMutex<PlaybackStats>>) -> bool {
+        match stats.lock() {
+            Ok(s) => s
+                .awaiting_playing_confirmation_since
+                .is_some_and(|since| since.elapsed() > PLAYING_CONFIRMATION_TIMEOUT),
+            Err(_) => true,
         }
     }
 
@@ -357,6 +393,7 @@ impl LibrespotPlayer {
             s.progress_ms = 0;
             s.play_started_at = Some(std::time::Instant::now());
             s.current_track_id = Some(track_id.clone());
+            s.awaiting_playing_confirmation_since = Some(std::time::Instant::now());
         }
 
         Ok(())
@@ -400,6 +437,7 @@ impl LibrespotPlayer {
         if let Ok(mut s) = state.stats.lock() {
             s.is_playing = true;
             s.play_started_at = Some(std::time::Instant::now());
+            s.awaiting_playing_confirmation_since = Some(std::time::Instant::now());
         }
         Ok(())
     }
@@ -453,7 +491,18 @@ impl LibrespotPlayer {
                     .stats
                     .lock()
                     .map(|s| {
-                        let live_ms = if s.is_playing {
+                        // A play()/start_queue() that never got a real event
+                        // confirming it is a session whose socket likely died
+                        // silently in the background. Report it as not-playing
+                        // so the existing "expected PLAYING but snapshot says
+                        // paused" recovery path in Kotlin kicks in and forces
+                        // a fresh reconnect, instead of masking the failure
+                        // forever behind an optimistic flag.
+                        let stalled = s
+                            .awaiting_playing_confirmation_since
+                            .is_some_and(|since| since.elapsed() > PLAYING_CONFIRMATION_TIMEOUT);
+                        let effective_is_playing = s.is_playing && !stalled;
+                        let live_ms = if effective_is_playing {
                             s.play_started_at
                                 .map(|t| s.progress_ms + t.elapsed().as_millis() as u64)
                                 .unwrap_or(s.progress_ms)
@@ -461,7 +510,7 @@ impl LibrespotPlayer {
                             s.progress_ms
                         };
                         (
-                            s.is_playing,
+                            effective_is_playing,
                             live_ms,
                             s.end_of_track_count,
                             s.current_track_id.clone(),
@@ -508,4 +557,36 @@ fn not_connected_error() -> SpotifyEngineError {
         "librespot_not_connected",
         "Player is not connected. Call connect() first.",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_confirmation_stalled_with_poisoned_lock() {
+        let stats = Arc::new(StdMutex::new(PlaybackStats::default()));
+        let poisoned_stats = Arc::clone(&stats);
+
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned_stats.lock().unwrap();
+            panic!("poison playback stats mutex");
+        });
+
+        assert!(LibrespotPlayer::playback_confirmation_stalled(&stats));
+    }
+
+    #[test]
+    fn playback_confirmation_stalled_after_timeout() {
+        let stats = Arc::new(StdMutex::new(PlaybackStats {
+            awaiting_playing_confirmation_since: Some(
+                std::time::Instant::now()
+                    - PLAYING_CONFIRMATION_TIMEOUT
+                    - std::time::Duration::from_millis(1),
+            ),
+            ..PlaybackStats::default()
+        }));
+
+        assert!(LibrespotPlayer::playback_confirmation_stalled(&stats));
+    }
 }

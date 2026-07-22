@@ -61,6 +61,12 @@ struct BridgeState {
     // Last access token used for playback — stored so transport commands can
     // transparently reconnect the librespot session after expiry or app restart.
     playback_access_token: Option<String>,
+    // The token PLAYER's current live librespot session was actually connected
+    // with. is_healthy() only reflects thread/session liveness, not token
+    // validity, so this is compared against playback_access_token to detect
+    // when a stale session must be torn down and reconnected with a fresh
+    // token (e.g. after re-authenticating following a revoked session).
+    connected_access_token: Option<String>,
     // Local playback state mirrored for snapshot responses.
     playback_queue: Vec<String>,
     playback_index: usize,
@@ -77,6 +83,7 @@ impl Default for BridgeState {
             client_id: None,
             engine: None,
             playback_access_token: None,
+            connected_access_token: None,
             playback_queue: Vec::new(),
             playback_index: 0,
             playback_volume_percent: 100,
@@ -101,6 +108,16 @@ static TOKIO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         .enable_all()
         .build()
         .expect("failed to initialize tokio runtime for android ffi bridge")
+});
+/// Dedicated runtime for Spotify/librespot playback calls, kept separate from
+/// TOKIO_RUNTIME (catalog/provider API calls) so a slow playlist fetch can't
+/// starve the scheduler threads that decode/stream audio and cause skipping.
+static PLAYBACK_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+    Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("failed to initialize tokio runtime for spotify playback")
 });
 
 #[derive(Clone, Default)]
@@ -253,6 +270,19 @@ fn lock_state() -> Result<std::sync::MutexGuard<'static, BridgeState>, String> {
         .map_err(|_| "Bridge state mutex poisoned".to_string())
 }
 
+// is_healthy() only checks that the librespot Session/Player objects haven't been
+// marked invalid — it can't detect a socket that died silently in the background
+// (Doze, network change) while the objects themselves remain intact. When a
+// command fails even though we believed the session was healthy, clear the
+// recorded token so the next attempt forces a real disconnect/reconnect instead
+// of repeating the same failure forever (previously required a force-stop to
+// recover).
+fn mark_player_session_dead() {
+    if let Ok(mut state) = lock_state() {
+        state.connected_access_token = None;
+    }
+}
+
 fn parse_normalization_source(source: Option<&str>) -> AudioNormalizationSource {
     match source
         .map(|value| value.trim().to_ascii_lowercase())
@@ -374,7 +404,7 @@ fn handle_init(config_json: &str) -> String {
         config.clone(),
         AndroidSpotifyBackend,
     ));
-    let ready = TOKIO_RUNTIME.block_on(engine.is_ready());
+    let ready = PLAYBACK_RUNTIME.block_on(engine.is_ready());
 
     let mut state = match lock_state() {
         Ok(state) => state,
@@ -509,9 +539,9 @@ fn handle_spotify_init_session(token_input: &str) -> String {
         state.playback_access_token = Some(access_token.clone());
     }
 
-    match TOKIO_RUNTIME.block_on(engine.initialize_with_token(token)) {
+    match PLAYBACK_RUNTIME.block_on(engine.initialize_with_token(token)) {
         Ok(()) => {
-            let ready = TOKIO_RUNTIME.block_on(engine.is_ready());
+            let ready = PLAYBACK_RUNTIME.block_on(engine.is_ready());
             success_response(json!({
                 "ready": ready
             }))
@@ -531,7 +561,7 @@ fn handle_spotify_session_ready() -> String {
         }
     };
 
-    let ready = TOKIO_RUNTIME.block_on(engine.is_ready());
+    let ready = PLAYBACK_RUNTIME.block_on(engine.is_ready());
     success_response(json!({
         "initialized": true,
         "ready": ready
@@ -595,24 +625,47 @@ fn handle_spotify_start_queue(config_json: &str) -> String {
         }
     };
 
-    // If the player is already healthy, skip the expensive disconnect/reconnect
-    // cycle and just load the new track directly. This avoids a ~250ms+ gap where
-    // the old track's audio buffer continues playing while a brand-new session
-    // connects, which caused the "wrong audio on manual skip" bug.
-    let already_healthy = TOKIO_RUNTIME.block_on(PLAYER.is_healthy());
+    // is_healthy() only reflects whether the librespot session/player thread is
+    // still alive — it says nothing about whether the token that session was
+    // opened with is still valid. If the caller is now presenting a different
+    // token (e.g. after re-authenticating following a revoked/expired session),
+    // the stale session must be torn down and reconnected even though it still
+    // reports healthy, otherwise playback stays stuck on the old credentials
+    // until the process is restarted.
+    let token_changed = {
+        let state = match lock_state() {
+            Ok(state) => state,
+            Err(error) => return error_response("bridge_state_error", error),
+        };
+        state.connected_access_token.as_deref() != Some(token_owned.as_str())
+    };
+
+    // If the player is already healthy and the token hasn't changed, skip the
+    // expensive disconnect/reconnect cycle and just load the new track
+    // directly. This avoids a ~250ms+ gap where the old track's audio buffer
+    // continues playing while a brand-new session connects, which caused the
+    // "wrong audio on manual skip" bug.
+    let already_healthy = !token_changed && PLAYBACK_RUNTIME.block_on(PLAYER.is_healthy());
 
     if !already_healthy {
         // Fresh connection (or stale session): tear down, then connect.
-        TOKIO_RUNTIME.block_on(PLAYER.disconnect());
+        PLAYBACK_RUNTIME.block_on(PLAYER.disconnect());
 
-        if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.connect(&token_owned, &client_id_owned)) {
+        if let Err(error) =
+            PLAYBACK_RUNTIME.block_on(PLAYER.connect(&token_owned, &client_id_owned))
+        {
             return error_response("librespot_connect_failed", error.message);
+        }
+
+        if let Ok(mut state) = lock_state() {
+            state.connected_access_token = Some(token_owned.clone());
         }
     }
 
     if let Err(error) =
-        TOKIO_RUNTIME.block_on(PLAYER.start_queue(&normalized_track_ids, start_index))
+        PLAYBACK_RUNTIME.block_on(PLAYER.start_queue(&normalized_track_ids, start_index))
     {
+        mark_player_session_dead();
         return error_response("librespot_start_queue_failed", error.message);
     }
 
@@ -629,7 +682,7 @@ fn handle_spotify_start_queue(config_json: &str) -> String {
             &state.adaptive_normalization,
         )
     };
-    if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.set_volume(output_volume)) {
+    if let Err(error) = PLAYBACK_RUNTIME.block_on(PLAYER.set_volume(output_volume)) {
         return error_response("librespot_set_volume_failed", error.message);
     }
 
@@ -671,14 +724,23 @@ fn handle_spotify_start_queue(config_json: &str) -> String {
 /// transport commands (play, seek, etc.) have a loaded track to act on.
 /// Returns an error string if the connection cannot be established.
 fn ensure_player_connected() -> Result<(), String> {
-    if TOKIO_RUNTIME.block_on(PLAYER.is_healthy()) {
+    // is_healthy() only reflects thread/session liveness, not token validity —
+    // also require the live session's token to match the latest known token so
+    // a stale post-reauth session gets torn down and reconnected instead of
+    // silently reused.
+    let token_matches = {
+        let state = lock_state()?;
+        state.connected_access_token.is_some()
+            && state.connected_access_token == state.playback_access_token
+    };
+    if token_matches && PLAYBACK_RUNTIME.block_on(PLAYER.is_healthy()) {
         return Ok(());
     }
 
     // If connected but unhealthy (stale session / dead player thread),
     // tear down the old state so the reconnect below starts fresh.
-    if TOKIO_RUNTIME.block_on(PLAYER.is_connected()) {
-        TOKIO_RUNTIME.block_on(PLAYER.disconnect());
+    if PLAYBACK_RUNTIME.block_on(PLAYER.is_connected()) {
+        PLAYBACK_RUNTIME.block_on(PLAYER.disconnect());
     }
 
     let (token, client_id, queue, index, repeat_mode) = {
@@ -698,13 +760,17 @@ fn ensure_player_connected() -> Result<(), String> {
         )
     };
 
-    TOKIO_RUNTIME
+    PLAYBACK_RUNTIME
         .block_on(PLAYER.connect(&token, &client_id))
         .map_err(|e| e.message)?;
 
+    if let Ok(mut state) = lock_state() {
+        state.connected_access_token = Some(token.clone());
+    }
+
     // Restore the last-known track so subsequent play/seek/pause work.
     if !queue.is_empty() {
-        TOKIO_RUNTIME
+        PLAYBACK_RUNTIME
             .block_on(PLAYER.start_queue(&queue, index))
             .map_err(|e| e.message)?;
 
@@ -737,7 +803,7 @@ fn try_preload_next_spotify_track(
 
 fn try_preload_spotify_track_id(next_track_id: Option<&str>) {
     if let Some(next_id) = next_track_id
-        && let Err(e) = TOKIO_RUNTIME.block_on(PLAYER.preload(next_id))
+        && let Err(e) = PLAYBACK_RUNTIME.block_on(PLAYER.preload(next_id))
     {
         log::debug!("spotify preload next track skipped: {}", e.message);
     }
@@ -753,19 +819,22 @@ where
 
     match command() {
         Ok(()) => success_response(success_payload),
-        Err(error) => error_response("spotify_playback_command_failed", error.message),
+        Err(error) => {
+            mark_player_session_dead();
+            error_response("spotify_playback_command_failed", error.message)
+        }
     }
 }
 
 fn handle_spotify_play() -> String {
     run_connected_player_command(json!({ "playing": true }), || {
-        TOKIO_RUNTIME.block_on(PLAYER.play())
+        PLAYBACK_RUNTIME.block_on(PLAYER.play())
     })
 }
 
 fn handle_spotify_pause() -> String {
     run_connected_player_command(json!({ "playing": false }), || {
-        TOKIO_RUNTIME.block_on(PLAYER.pause())
+        PLAYBACK_RUNTIME.block_on(PLAYER.pause())
     })
 }
 
@@ -798,7 +867,8 @@ fn handle_spotify_next() -> String {
     if let Err(msg) = ensure_player_connected() {
         return error_response("spotify_playback_command_failed", msg);
     }
-    if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.start_queue(&track_ids, next_index)) {
+    if let Err(error) = PLAYBACK_RUNTIME.block_on(PLAYER.start_queue(&track_ids, next_index)) {
+        mark_player_session_dead();
         return error_response("librespot_next_failed", error.message);
     }
 
@@ -833,7 +903,8 @@ fn handle_spotify_previous() -> String {
     if let Err(msg) = ensure_player_connected() {
         return error_response("spotify_playback_command_failed", msg);
     }
-    if let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.start_queue(&track_ids, prev_index)) {
+    if let Err(error) = PLAYBACK_RUNTIME.block_on(PLAYER.start_queue(&track_ids, prev_index)) {
+        mark_player_session_dead();
         return error_response("librespot_previous_failed", error.message);
     }
 
@@ -849,7 +920,7 @@ fn handle_spotify_seek(config_json: &str) -> String {
     };
 
     run_connected_player_command(json!({ "position_ms": payload.position_ms }), || {
-        TOKIO_RUNTIME.block_on(PLAYER.seek(payload.position_ms))
+        PLAYBACK_RUNTIME.block_on(PLAYER.seek(payload.position_ms))
     })
 }
 
@@ -881,7 +952,7 @@ fn handle_spotify_set_volume(config_json: &str) -> String {
             "volume_percent": requested_volume_percent,
             "output_volume_percent": output_volume_percent
         }),
-        || TOKIO_RUNTIME.block_on(PLAYER.set_volume(output_volume_percent)),
+        || PLAYBACK_RUNTIME.block_on(PLAYER.set_volume(output_volume_percent)),
     )
 }
 
@@ -926,8 +997,8 @@ fn handle_set_audio_normalization_settings(config_json: &str) -> String {
         (state.playback_volume_percent, output)
     };
 
-    if TOKIO_RUNTIME.block_on(PLAYER.is_connected())
-        && let Err(error) = TOKIO_RUNTIME.block_on(PLAYER.set_volume(output_volume_percent))
+    if PLAYBACK_RUNTIME.block_on(PLAYER.is_connected())
+        && let Err(error) = PLAYBACK_RUNTIME.block_on(PLAYER.set_volume(output_volume_percent))
     {
         return error_response("librespot_set_volume_failed", error.message);
     }
@@ -1011,7 +1082,7 @@ fn handle_spotify_set_repeat_mode(config_json: &str) -> String {
 }
 
 fn handle_spotify_snapshot() -> String {
-    let snapshot = TOKIO_RUNTIME.block_on(PLAYER.snapshot());
+    let snapshot = PLAYBACK_RUNTIME.block_on(PLAYER.snapshot());
     let state = match lock_state() {
         Ok(state) => state,
         Err(error) => return error_response("bridge_state_error", error),
