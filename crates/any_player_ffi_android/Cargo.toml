@@ -10,7 +10,7 @@ crate-type = ["cdylib", "rlib"]
 any_player_core = { path = "../any_player_core" }
 any_player_spotify_engine = { path = "../any_player_spotify_engine" }
 async-trait = "0.1"
-android_logger = "0.14"
+android_logger = "0.15"
 jni = { version = "0.21", features = ["default"] }
 log = "0.4"
 ndk-context = "0.1"
