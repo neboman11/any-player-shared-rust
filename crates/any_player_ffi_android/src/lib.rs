@@ -651,7 +651,9 @@ fn handle_spotify_start_queue(config_json: &str) -> String {
         // Fresh connection (or stale session): tear down, then connect.
         PLAYBACK_RUNTIME.block_on(PLAYER.disconnect());
 
-        if let Err(error) = PLAYBACK_RUNTIME.block_on(PLAYER.connect(&token_owned, &client_id_owned)) {
+        if let Err(error) =
+            PLAYBACK_RUNTIME.block_on(PLAYER.connect(&token_owned, &client_id_owned))
+        {
             return error_response("librespot_connect_failed", error.message);
         }
 
