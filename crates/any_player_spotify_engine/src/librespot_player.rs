@@ -564,7 +564,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn playback_confirmation_stalled_is_true_when_stats_lock_is_poisoned() {
+    fn test_playback_confirmation_stalled_with_poisoned_lock() {
         let stats = Arc::new(StdMutex::new(PlaybackStats::default()));
         let poisoned_stats = Arc::clone(&stats);
 
@@ -577,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn playback_confirmation_stalled_is_true_after_timeout() {
+    fn test_playback_confirmation_stalled_after_timeout() {
         let stats = Arc::new(StdMutex::new(PlaybackStats {
             awaiting_playing_confirmation_since: Some(
                 std::time::Instant::now()
