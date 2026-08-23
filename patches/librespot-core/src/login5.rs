@@ -245,7 +245,11 @@ impl Login5Manager {
                     inner.auth_token = None;
                 }
             }
-            (inner.auth_token.clone(), inner.oauth_token.clone(), inner.oauth_client_id.clone())
+            (
+                inner.auth_token.clone(),
+                inner.oauth_token.clone(),
+                inner.oauth_client_id.clone(),
+            )
         });
 
         if let Some(auth_token) = cached_token {

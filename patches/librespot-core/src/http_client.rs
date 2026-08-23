@@ -195,28 +195,47 @@ impl HttpClient {
             *req.headers_mut() = parts.headers.clone();
 
             let request = self.request_fut(req)?;
-            let response = request.await;
+            let response = request.await?;
+            let code = response.status();
 
-            if let Ok(response) = &response {
-                let code = response.status();
-
-                if code == StatusCode::TOO_MANY_REQUESTS {
-                    if let Some(duration) = Self::get_retry_after(response.headers()) {
-                        warn!(
-                            "Rate limited by service, retrying in {} seconds...",
-                            duration.as_secs()
-                        );
-                        tokio::time::sleep(duration).await;
-                        continue;
-                    }
-                }
-
-                if !code.is_success() {
-                    return Err(HttpClientError::StatusCode(code).into());
+            if code == StatusCode::TOO_MANY_REQUESTS {
+                if let Some(duration) = Self::get_retry_after(response.headers()) {
+                    warn!(
+                        "Rate limited by service, retrying in {} seconds...",
+                        duration.as_secs()
+                    );
+                    tokio::time::sleep(duration).await;
+                    continue;
                 }
             }
 
-            let response = response?;
+            if !code.is_success() {
+                // Log the response body on error responses (4xx/5xx) since Spotify
+                // often includes diagnostic details (e.g. RBAC denial reasons) that
+                // are otherwise lost.
+                let uri = parts.uri.clone();
+                match response.into_body().collect().await {
+                    Ok(collected) => {
+                        let bytes = collected.to_bytes();
+                        let body_text = String::from_utf8_lossy(&bytes);
+                        warn!(
+                            "HTTP {} for {}: {}",
+                            code,
+                            uri,
+                            if body_text.is_empty() {
+                                "<empty body>"
+                            } else {
+                                &body_text
+                            }
+                        );
+                    }
+                    Err(e) => {
+                        warn!("HTTP {} for {}: <failed to read body: {}>", code, uri, e);
+                    }
+                }
+                return Err(HttpClientError::StatusCode(code).into());
+            }
+
             return Ok(response);
         }
     }

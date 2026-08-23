@@ -113,10 +113,11 @@ impl LibrespotPlayer {
             ));
         }
 
-        // Use default session config. With OS forced to "linux" in config.rs,
-        // this uses KEYMASTER_CLIENT_ID and Linux UA/platform data, matching the
-        // standard Spotify desktop client. Login5 StoredCredential with KEYMASTER
-        // works on this path (same as librespot CLI on Linux).
+        // Use default session config (KEYMASTER_CLIENT_ID via OS="linux" in
+        // config.rs). This is required for the clienttoken.spotify.com
+        // request to succeed; Login5 itself is bypassed below via
+        // inject_bearer_token since it rejects this app's third-party OAuth
+        // client_id under every method (StoredCredential, OneTimeToken).
         let session_config = SessionConfig::default();
 
         let credentials = Credentials::with_access_token(token);
@@ -127,7 +128,14 @@ impl LibrespotPlayer {
             .await
             .map_err(|e| SpotifyEngineError::new("librespot_connect_failed", e.to_string()))?;
 
-        log::debug!("librespot: session connected (KEYMASTER/Linux desktop mode)");
+        // Login5 (login5.spotify.com) rejects this app's third-party OAuth
+        // client_id outright for both StoredCredential and OneTimeToken
+        // exchange (confirmed via BAD_REQUEST/INVALID_CREDENTIALS testing).
+        // Bypass Login5 entirely and use the OAuth access token directly as
+        // the spclient bearer token.
+        session.login5().inject_bearer_token(token, 0);
+
+        log::debug!("librespot: session connected (bearer token injected, Login5 bypassed)");
 
         let player_config = PlayerConfig::default();
         // F32 has broader device compatibility than the S16 default; this is
@@ -432,6 +440,26 @@ impl LibrespotPlayer {
     pub async fn play(&self) -> Result<(), SpotifyEngineError> {
         let mut guard = self.inner.lock().await;
         let state = guard.as_mut().ok_or_else(not_connected_error)?;
+
+        // `Player::play()` is only meaningful once a track has been `load()`ed
+        // into it via `start_queue()`. A freshly (re)connected session — e.g.
+        // right after re-authenticating — has a brand-new `Player` with
+        // nothing loaded, so calling `play()` here would be a silent no-op:
+        // no audio ever starts, yet we'd report success and skip the
+        // reload-queue fallback callers rely on. Error out instead so callers
+        // fall back to `start_queue()`.
+        let has_loaded_track = state
+            .stats
+            .lock()
+            .map(|s| s.current_track_id.is_some())
+            .unwrap_or(false);
+        if !has_loaded_track {
+            return Err(SpotifyEngineError::new(
+                "librespot_no_track_loaded",
+                "No track has been loaded yet; call start_queue() instead",
+            ));
+        }
+
         state.player.play();
         // Optimistic update; PlayerEvent::Playing will confirm the real position.
         if let Ok(mut s) = state.stats.lock() {
