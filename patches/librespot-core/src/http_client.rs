@@ -218,16 +218,18 @@ impl HttpClient {
                     Ok(collected) => {
                         let bytes = collected.to_bytes();
                         let body_text = String::from_utf8_lossy(&bytes);
-                        warn!(
-                            "HTTP {} for {}: {}",
-                            code,
-                            uri,
-                            if body_text.is_empty() {
-                                "<empty body>"
-                            } else {
-                                &body_text
-                            }
-                        );
+                        const MAX_BODY_LOG: usize = 512;
+                        let truncated = if body_text.is_empty() {
+                            "<empty body>".to_string()
+                        } else if body_text.chars().count() > MAX_BODY_LOG {
+                            format!(
+                                "{}… (truncated)",
+                                body_text.chars().take(MAX_BODY_LOG).collect::<String>()
+                            )
+                        } else {
+                            body_text.into_owned()
+                        };
+                        warn!("HTTP {} for {}: {}", code, uri, truncated);
                     }
                     Err(e) => {
                         warn!("HTTP {} for {}: <failed to read body: {}>", code, uri, e);

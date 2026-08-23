@@ -30,8 +30,9 @@ type SharedEngine = Arc<SpotifySessionEngine<AndroidSpotifyBackend>>;
 
 struct BridgeState {
     engine: Option<SharedEngine>,
-    // Last access token used for playback — stored so transport commands can
-    // transparently reconnect the session after expiry or app restart.
+    // Last access token used for playback — stored so the session can be
+    // reconnected (e.g. after expiry or app restart) without requiring the
+    // caller to supply the token again.
     playback_access_token: Option<String>,
     playback_volume_percent: u8,
     audio_normalization: AudioNormalizationSettings,

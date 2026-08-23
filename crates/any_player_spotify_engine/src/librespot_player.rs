@@ -76,11 +76,6 @@ impl LibrespotPlayer {
     /// Connect to Spotify using an OAuth access token and start a librespot session.
     /// This must be called before any playback commands.
     ///
-    /// `client_id` must be the **same** OAuth client ID that was used to obtain
-    /// the `access_token`. librespot's Login5 service binds stored credentials
-    /// to the client ID that originally authenticated them; passing a mismatched
-    /// client ID causes `INVALID_CREDENTIALS` when loading tracks.
-    ///
     /// Concurrent callers are serialised: only the first proceeds; subsequent
     /// callers return immediately once the first succeeds (idempotent when
     /// already connected). To force a *new* connection (e.g. for a fresh queue)
@@ -88,7 +83,6 @@ impl LibrespotPlayer {
     pub async fn connect(
         &self,
         access_token: &str,
-        client_id: &str,
     ) -> Result<(), SpotifyEngineError> {
         // Serialise concurrent connect() attempts.
         let _lock = self.connecting.lock().await;
@@ -103,13 +97,6 @@ impl LibrespotPlayer {
             return Err(SpotifyEngineError::new(
                 "spotify_access_token_missing",
                 "Access token is required to connect",
-            ));
-        }
-        let cid = client_id.trim();
-        if cid.is_empty() {
-            return Err(SpotifyEngineError::new(
-                "spotify_client_id_missing",
-                "Client ID is required to connect",
             ));
         }
 
