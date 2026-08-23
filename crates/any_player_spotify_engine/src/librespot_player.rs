@@ -435,11 +435,15 @@ impl LibrespotPlayer {
         // no audio ever starts, yet we'd report success and skip the
         // reload-queue fallback callers rely on. Error out instead so callers
         // fall back to `start_queue()`.
-        let has_loaded_track = state
-            .stats
-            .lock()
-            .map(|s| s.current_track_id.is_some())
-            .unwrap_or(false);
+        let has_loaded_track = match state.stats.lock() {
+            Ok(s) => s.current_track_id.is_some(),
+            Err(_) => {
+                return Err(SpotifyEngineError::new(
+                    "librespot_stats_unavailable",
+                    "Playback stats mutex is poisoned; internal state is inconsistent",
+                ));
+            }
+        };
         if !has_loaded_track {
             return Err(SpotifyEngineError::new(
                 "librespot_no_track_loaded",

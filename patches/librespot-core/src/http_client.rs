@@ -210,29 +210,32 @@ impl HttpClient {
             }
 
             if !code.is_success() {
-                // Log the response body on error responses (4xx/5xx) since Spotify
-                // often includes diagnostic details (e.g. RBAC denial reasons) that
-                // are otherwise lost.
                 let uri = parts.uri.clone();
-                match response.into_body().collect().await {
-                    Ok(collected) => {
-                        let bytes = collected.to_bytes();
-                        let body_text = String::from_utf8_lossy(&bytes);
-                        const MAX_BODY_LOG: usize = 512;
-                        let truncated = if body_text.is_empty() {
-                            "<empty body>".to_string()
-                        } else if body_text.chars().count() > MAX_BODY_LOG {
-                            format!(
-                                "{}… (truncated)",
-                                body_text.chars().take(MAX_BODY_LOG).collect::<String>()
-                            )
-                        } else {
-                            body_text.into_owned()
-                        };
-                        warn!("HTTP {} for {}: {}", code, uri, truncated);
-                    }
-                    Err(e) => {
-                        warn!("HTTP {} for {}: <failed to read body: {}>", code, uri, e);
+                warn!("HTTP {} for {}", code, uri);
+                // Only read and log the response body at debug level to avoid
+                // overhead and potential leakage of sensitive error payloads in
+                // production warn-level logs.
+                if log::log_enabled!(log::Level::Debug) {
+                    match response.into_body().collect().await {
+                        Ok(collected) => {
+                            let bytes = collected.to_bytes();
+                            let body_text = String::from_utf8_lossy(&bytes);
+                            const MAX_BODY_LOG: usize = 512;
+                            let truncated = if body_text.is_empty() {
+                                "<empty body>".to_string()
+                            } else if body_text.chars().count() > MAX_BODY_LOG {
+                                format!(
+                                    "{}… (truncated)",
+                                    body_text.chars().take(MAX_BODY_LOG).collect::<String>()
+                                )
+                            } else {
+                                body_text.into_owned()
+                            };
+                            debug!("HTTP {} for {} body: {}", code, uri, truncated);
+                        }
+                        Err(e) => {
+                            debug!("HTTP {} for {}: <failed to read body: {}>", code, uri, e);
+                        }
                     }
                 }
                 return Err(HttpClientError::StatusCode(code).into());
