@@ -80,10 +80,7 @@ impl LibrespotPlayer {
     /// callers return immediately once the first succeeds (idempotent when
     /// already connected). To force a *new* connection (e.g. for a fresh queue)
     /// call `disconnect()` first, then `connect()`.
-    pub async fn connect(
-        &self,
-        access_token: &str,
-    ) -> Result<(), SpotifyEngineError> {
+    pub async fn connect(&self, access_token: &str) -> Result<(), SpotifyEngineError> {
         // Serialise concurrent connect() attempts.
         let _lock = self.connecting.lock().await;
 
