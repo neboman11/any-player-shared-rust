@@ -526,15 +526,8 @@ fn read_jstring(
         .map_err(|error| format!("Failed to read {} argument: {}", argument_name, error))
 }
 
-/// Called by the Android runtime as soon as `libany_player_ffi_android.so` is
-/// loaded. We use it to wire up `android_logger` so that all `log::*` calls
-/// Called by the JVM when our shared library is first loaded.
-///
-/// 1. Initialises the `android_logger` backend so Rust `log::*` calls are
-///    visible in logcat under the tag `any_player_rust`.
-/// 2. Registers the Android JavaVM + Application-context pointer with
-///    `ndk_context` so that cpal/AAudio can open audio streams without
-///    hitting the "android context was not initialized" panic.
+/// Called by the JVM when our shared library is first loaded to initialize
+/// `android_logger` for Rust logs in logcat under the `any_player_rust` tag.
 ///
 /// # Safety
 /// The JVM must invoke this function with a valid, non-null `JavaVM*` that
@@ -542,7 +535,7 @@ fn read_jstring(
 /// specification for `JNI_OnLoad`.
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn JNI_OnLoad(
-    vm: *mut jni::sys::JavaVM,
+    _vm: *mut jni::sys::JavaVM,
     _reserved: *mut std::ffi::c_void,
 ) -> jni::sys::jint {
     android_logger::init_once(
@@ -552,81 +545,7 @@ pub unsafe extern "system" fn JNI_OnLoad(
     );
     log::info!("any_player_rust JNI_OnLoad: logger initialised");
 
-    // Initialise ndk-context so that cpal's AAudio backend can obtain the
-    // Android AudioManager via JNI.  We do this by calling into Java to
-    // retrieve the current Application context and storing the pair
-    // (JavaVM*, jobject context) as a global reference.
-    //
-    // Safety: `vm` is valid for the lifetime of the process; the global JNI
-    // reference to the context is kept alive indefinitely (intentional — we
-    // need it for the lifetime of the player).
-    unsafe {
-        match init_ndk_context(vm) {
-            Ok(()) => log::info!("any_player_rust JNI_OnLoad: ndk-context initialised"),
-            Err(e) => log::error!(
-                "any_player_rust JNI_OnLoad: failed to initialise ndk-context: {}. \
-                 Audio playback may not work.",
-                e
-            ),
-        }
-    }
-
     jni::sys::JNI_VERSION_1_6
-}
-
-/// Retrieves the Android Application context via reflection and stores it in
-/// `ndk_context` so that cpal's AAudio host can use it.
-///
-/// # Safety
-/// `vm` must be a valid, non-null `JavaVM*` pointer for the lifetime of the
-/// process.
-unsafe fn init_ndk_context(vm: *mut jni::sys::JavaVM) -> Result<(), String> {
-    use jni::{JNIEnv, JavaVM};
-
-    let jvm = unsafe { JavaVM::from_raw(vm) }.map_err(|e| format!("JavaVM::from_raw: {e}"))?;
-
-    let mut guard = jvm
-        .attach_current_thread()
-        .map_err(|e| format!("attach_current_thread: {e}"))?;
-    let env: &mut JNIEnv<'_> = &mut guard;
-
-    // ActivityThread.currentApplication() is a static method that returns the
-    // global Application singleton — it's available from any thread, even
-    // before any Activity is started.
-    let activity_thread = env
-        .find_class("android/app/ActivityThread")
-        .map_err(|e| format!("find_class ActivityThread: {e}"))?;
-
-    let app_obj = env
-        .call_static_method(
-            activity_thread,
-            "currentApplication",
-            "()Landroid/app/Application;",
-            &[],
-        )
-        .map_err(|e| format!("call currentApplication: {e}"))?
-        .l()
-        .map_err(|e| format!("result as object: {e}"))?;
-
-    if app_obj.is_null() {
-        return Err("currentApplication() returned null".to_string());
-    }
-
-    // Promote to a global JNI reference so the object is not collected.
-    let global_app = env
-        .new_global_ref(app_obj)
-        .map_err(|e| format!("new_global_ref: {e}"))?;
-
-    // Leak the global ref intentionally — we need it for the process lifetime.
-    let ctx_ptr = global_app.as_raw() as *mut std::ffi::c_void;
-    std::mem::forget(global_app);
-
-    // Safety: both `vm` and `ctx_ptr` are valid for the process lifetime.
-    unsafe {
-        ndk_context::initialize_android_context(vm as *mut std::ffi::c_void, ctx_ptr);
-    }
-
-    Ok(())
 }
 
 #[unsafe(no_mangle)]

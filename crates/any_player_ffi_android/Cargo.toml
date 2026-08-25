@@ -11,7 +11,6 @@ any_player_core = { path = "../any_player_core" }
 android_logger = "0.15"
 jni = { version = "0.21", features = ["default"] }
 log = "0.4"
-ndk-context = "0.1"
 once_cell = "1"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
