@@ -3,7 +3,6 @@
 Shared Rust workspace for Any Player platform integrations (desktop + Android), including:
 
 - portable domain/provider contracts (`any_player_core`)
-- Spotify session/playback engine primitives (`any_player_spotify_engine`)
 - Android JNI bridge crate (`any_player_ffi_android`)
 
 ## Workspace crates
@@ -11,16 +10,13 @@ Shared Rust workspace for Any Player platform integrations (desktop + Android), 
 - `crates/any_player_core`
   - Shared models, provider contracts, and provider API/client modules.
   - Platform-agnostic by design (no UI/runtime shell assumptions).
-- `crates/any_player_spotify_engine`
-  - Runtime-agnostic Spotify session engine and librespot-backed player wrapper.
-  - Exposes session lifecycle and playback-facing primitives used by platform adapters.
 - `crates/any_player_ffi_android`
   - JNI-facing bridge for Android.
   - Exports token/session/auth/playback entry points as JSON-based interfaces.
 
-## Why `patches/librespot-core` exists
+## Desktop `librespot-core` patch
 
-This workspace patches `librespot-core` via `[patch.crates-io]` in the root `Cargo.toml` to avoid a build-script dependency conflict. The patch keeps source behavior intact while adjusting build-time dependency wiring.
+`patches/librespot-core` is retained for the Desktop shell, which applies the source override from its own Cargo manifest.
 
 ## Prerequisites
 
