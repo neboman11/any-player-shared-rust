@@ -12,11 +12,7 @@ Shared Rust workspace for Any Player platform integrations (desktop + Android), 
   - Platform-agnostic by design (no UI/runtime shell assumptions).
 - `crates/any_player_ffi_android`
   - JNI-facing bridge for Android.
-  - Exports token/session/auth/playback entry points as JSON-based interfaces.
-
-## Desktop `librespot-core` patch
-
-`patches/librespot-core` is retained for the Desktop shell, which applies the source override from its own Cargo manifest.
+  - Exports Spotify authorization, provider API, and audio-normalization entry points as JSON-based interfaces.
 
 ## Prerequisites
 

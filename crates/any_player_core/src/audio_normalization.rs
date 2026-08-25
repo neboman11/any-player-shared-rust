@@ -10,7 +10,7 @@ pub const INTERNAL_NORMALIZATION_TARGET: u32 = 85;
 /// require different normalization strategies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioNormalizationSource {
-    /// Audio streamed from Spotify via librespot.
+    /// Audio from Spotify.
     Spotify,
     /// Audio from any other provider (e.g. Jellyfin, Plex).
     Other,
