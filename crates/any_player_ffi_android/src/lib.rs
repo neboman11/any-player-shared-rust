@@ -8,11 +8,6 @@ use any_player_core::provider_clients::{
     jellyfin::JellyfinApiClient, plex::PlexApiClient, spotify::SpotifyApiClient,
 };
 use any_player_core::providers::ProviderAuthRequest;
-use any_player_spotify_engine::{
-    SpotifyEngineError, SpotifySessionBackend, SpotifySessionConfig, SpotifySessionEngine,
-    SpotifyToken,
-};
-use async_trait::async_trait;
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::jstring;
@@ -20,16 +15,12 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{Duration, timeout};
 use url::form_urlencoded;
 
-type SharedEngine = Arc<SpotifySessionEngine<AndroidSpotifyBackend>>;
-
 struct BridgeState {
-    engine: Option<SharedEngine>,
     playback_volume_percent: u8,
     audio_normalization: AudioNormalizationSettings,
     adaptive_normalization: AdaptiveNormalizationState,
@@ -38,7 +29,6 @@ struct BridgeState {
 impl Default for BridgeState {
     fn default() -> Self {
         Self {
-            engine: None,
             playback_volume_percent: 100,
             audio_normalization: AudioNormalizationSettings {
                 enabled: false,
@@ -58,57 +48,6 @@ static TOKIO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         .build()
         .expect("failed to initialize tokio runtime for android ffi bridge")
 });
-/// Dedicated runtime for Spotify/librespot playback calls, kept separate from
-/// TOKIO_RUNTIME (catalog/provider API calls) so a slow playlist fetch can't
-/// starve the scheduler threads that decode/stream audio and cause skipping.
-static PLAYBACK_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-    Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("failed to initialize tokio runtime for spotify playback")
-});
-
-#[derive(Clone, Default)]
-struct AndroidSpotifyBackend;
-
-#[derive(Debug, Clone)]
-struct AndroidSessionHandle {
-    initialized_at_epoch_seconds: u64,
-}
-
-#[async_trait]
-impl SpotifySessionBackend for AndroidSpotifyBackend {
-    type SessionHandle = AndroidSessionHandle;
-
-    async fn connect(
-        &self,
-        _config: &SpotifySessionConfig,
-        access_token: &str,
-    ) -> Result<Self::SessionHandle, SpotifyEngineError> {
-        if access_token.trim().is_empty() {
-            return Err(SpotifyEngineError::new(
-                "spotify_access_token_missing",
-                "Spotify access_token is required",
-            ));
-        }
-
-        Ok(AndroidSessionHandle {
-            initialized_at_epoch_seconds: current_epoch_seconds(),
-        })
-    }
-
-    async fn disconnect(&self, session: &Self::SessionHandle) -> Result<(), SpotifyEngineError> {
-        let _ = session.initialized_at_epoch_seconds;
-        Ok(())
-    }
-}
-
-#[derive(Deserialize)]
-struct InitConfigPayload {
-    client_id: String,
-}
-
 #[derive(Deserialize)]
 struct BeginAuthPayload {
     client_id: String,
@@ -119,15 +58,6 @@ struct BeginAuthPayload {
     code_challenge: Option<String>,
     #[serde(default)]
     scopes: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct TokenPayload {
-    access_token: String,
-    #[serde(default)]
-    refresh_token: Option<String>,
-    #[serde(default)]
-    expires_at_epoch_seconds: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -157,13 +87,6 @@ struct ProviderApiCallPayload {
     offset: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
-}
-
-fn current_epoch_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
 }
 
 fn success_response(data: Value) -> String {
@@ -236,72 +159,6 @@ where
 {
     serde_json::from_str::<T>(raw_json)
         .map_err(|error| format!("Invalid {} payload: {}", field_name.trim(), error))
-}
-
-fn parse_token(raw_input: &str) -> Result<SpotifyToken, String> {
-    let trimmed = raw_input.trim();
-    if trimmed.is_empty() {
-        return Err("Spotify token payload is required".to_string());
-    }
-
-    if trimmed.starts_with('{') {
-        let parsed: TokenPayload = serde_json::from_str(trimmed)
-            .map_err(|error| format!("Invalid Spotify token JSON payload: {}", error))?;
-        let access_token = parsed.access_token.trim();
-        if access_token.is_empty() {
-            return Err("Spotify access_token is required".to_string());
-        }
-
-        return Ok(SpotifyToken {
-            access_token: access_token.to_string(),
-            refresh_token: parsed
-                .refresh_token
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
-            expires_at_epoch_seconds: parsed.expires_at_epoch_seconds,
-        });
-    }
-
-    Ok(SpotifyToken::with_access_token(trimmed.to_string()))
-}
-
-fn require_engine() -> Result<SharedEngine, String> {
-    let state = lock_state()?;
-    state
-        .engine
-        .clone()
-        .ok_or_else(|| "Bridge is not initialized. Call init(config_json) first.".to_string())
-}
-
-fn handle_init(config_json: &str) -> String {
-    let payload = match parse_required_json::<InitConfigPayload>(config_json, "init") {
-        Ok(payload) => payload,
-        Err(error) => return error_response("invalid_init_payload", error),
-    };
-
-    let client_id = payload.client_id.trim();
-    if client_id.is_empty() {
-        return error_response("spotify_client_id_missing", "Spotify client_id is required");
-    }
-
-    let config = SpotifySessionConfig::new(client_id.to_string());
-    let engine = Arc::new(SpotifySessionEngine::new(
-        config.clone(),
-        AndroidSpotifyBackend,
-    ));
-    let ready = PLAYBACK_RUNTIME.block_on(engine.is_ready());
-
-    let mut state = match lock_state() {
-        Ok(state) => state,
-        Err(error) => return error_response("bridge_state_error", error),
-    };
-    state.engine = Some(engine);
-
-    success_response(json!({
-        "initialized": true,
-        "ready": ready,
-        "client_id_present": true
-    }))
 }
 
 fn handle_spotify_begin_auth(config_json: &str) -> String {
@@ -390,61 +247,6 @@ fn handle_spotify_exchange_code(code: &str, verifier: &str, redirect: &str) -> S
         "platform_auth_required",
         "Spotify code exchange remains platform-owned. Use Android SpotifyClient exchangeAuthorizationCode.",
     )
-}
-
-fn handle_spotify_validate_token(token_input: &str) -> String {
-    let token = match parse_token(token_input) {
-        Ok(token) => token,
-        Err(error) => return error_response("invalid_spotify_token", error),
-    };
-
-    let expired = token.is_expired_at(current_epoch_seconds());
-    let valid = !expired && !token.access_token.trim().is_empty();
-    success_response(json!({
-        "valid": valid,
-        "expired": expired,
-        "has_refresh_token": token.refresh_token.is_some()
-    }))
-}
-
-fn handle_spotify_init_session(token_input: &str) -> String {
-    let token = match parse_token(token_input) {
-        Ok(token) => token,
-        Err(error) => return error_response("invalid_spotify_token", error),
-    };
-
-    let engine = match require_engine() {
-        Ok(engine) => engine,
-        Err(error) => return error_response("bridge_not_initialized", error),
-    };
-
-    match PLAYBACK_RUNTIME.block_on(engine.initialize_with_token(token)) {
-        Ok(()) => {
-            let ready = PLAYBACK_RUNTIME.block_on(engine.is_ready());
-            success_response(json!({
-                "ready": ready
-            }))
-        }
-        Err(error) => error_response(error.code.as_str(), error.message),
-    }
-}
-
-fn handle_spotify_session_ready() -> String {
-    let engine = match require_engine() {
-        Ok(engine) => engine,
-        Err(_) => {
-            return success_response(json!({
-                "initialized": false,
-                "ready": false
-            }));
-        }
-    };
-
-    let ready = PLAYBACK_RUNTIME.block_on(engine.is_ready());
-    success_response(json!({
-        "initialized": true,
-        "ready": ready
-    }))
 }
 
 fn handle_get_audio_normalization_settings() -> String {
@@ -840,19 +642,6 @@ unsafe fn init_ndk_context(vm: *mut jni::sys::JavaVM) -> Result<(), String> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_init(
-    mut env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    config_json: JString<'_>,
-) -> jstring {
-    let payload = match read_jstring(&mut env, config_json, "config_json") {
-        Ok(value) => handle_init(&value),
-        Err(error) => error_response("jni_argument_error", error),
-    };
-    into_jstring(&mut env, payload)
-}
-
-#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_spotifyBeginAuth(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -885,41 +674,6 @@ pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_spo
             error_response("jni_argument_error", error)
         }
     };
-    into_jstring(&mut env, payload)
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_spotifyValidateToken(
-    mut env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    token_input: JString<'_>,
-) -> jstring {
-    let payload = match read_jstring(&mut env, token_input, "token_input") {
-        Ok(value) => handle_spotify_validate_token(&value),
-        Err(error) => error_response("jni_argument_error", error),
-    };
-    into_jstring(&mut env, payload)
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_spotifyInitSession(
-    mut env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    token_input: JString<'_>,
-) -> jstring {
-    let payload = match read_jstring(&mut env, token_input, "token_input") {
-        Ok(value) => handle_spotify_init_session(&value),
-        Err(error) => error_response("jni_argument_error", error),
-    };
-    into_jstring(&mut env, payload)
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_anyplayer_android_core_rust_RustBridgeNative_spotifySessionReady(
-    mut env: JNIEnv<'_>,
-    _class: JClass<'_>,
-) -> jstring {
-    let payload = handle_spotify_session_ready();
     into_jstring(&mut env, payload)
 }
 
@@ -978,27 +732,6 @@ mod tests {
 
     fn parse_json(payload: &str) -> Value {
         serde_json::from_str(payload).expect("expected valid json response")
-    }
-
-    #[test]
-    fn smoke_spotify_token_session_readiness_flow() {
-        let _guard = TEST_MUTEX.lock().expect("test mutex");
-
-        let init = parse_json(&handle_init(r#"{"client_id":"test-client-id"}"#));
-        assert_eq!(init["ok"], Value::Bool(true));
-
-        let validate = parse_json(&handle_spotify_validate_token("test-access-token"));
-        assert_eq!(validate["ok"], Value::Bool(true));
-        assert_eq!(validate["data"]["valid"], Value::Bool(true));
-
-        let init_session = parse_json(&handle_spotify_init_session("test-access-token"));
-        assert_eq!(init_session["ok"], Value::Bool(true));
-        assert_eq!(init_session["data"]["ready"], Value::Bool(true));
-
-        let ready = parse_json(&handle_spotify_session_ready());
-        assert_eq!(ready["ok"], Value::Bool(true));
-        assert_eq!(ready["data"]["initialized"], Value::Bool(true));
-        assert_eq!(ready["data"]["ready"], Value::Bool(true));
     }
 
     #[test]

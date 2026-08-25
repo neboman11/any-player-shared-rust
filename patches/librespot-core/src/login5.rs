@@ -7,7 +7,7 @@ use http::{HeaderValue, Method, Request, header::ACCEPT};
 use librespot_protocol::login5::login_response::Response;
 use librespot_protocol::{
     client_info::ClientInfo,
-    credentials::{OneTimeToken, Password, StoredCredential},
+    credentials::{Password, StoredCredential},
     hashcash::HashcashSolution,
     login5::{
         ChallengeSolution, LoginError, LoginOk, LoginRequest, LoginResponse,
@@ -26,14 +26,6 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(3);
 component! {
     Login5Manager : Login5ManagerInner {
         auth_token: Option<Token> = None,
-        // Raw OAuth access token set via set_oauth_token(). When present,
-        // auth_token() uses Login5 OneTimeToken instead of StoredCredential to
-        // avoid INVALID_CREDENTIALS from third-party OAuth client ID mismatch.
-        oauth_token: Option<String> = None,
-        // The OAuth client_id that was used to obtain the oauth_token. The
-        // Login5 OneTimeToken request must use the same client_id that the
-        // access token was issued to, otherwise Spotify returns INVALID_CREDENTIALS.
-        oauth_client_id: Option<String> = None,
     }
 }
 
@@ -66,48 +58,20 @@ impl From<Login5Error> for Error {
 }
 
 impl Login5Manager {
-    /// Store an OAuth access token and the client_id that was used to obtain it,
-    /// to be used for the Login5 `OneTimeToken` exchange. Call this after
-    /// `session.connect()` when the session was authenticated with
-    /// `Credentials::with_access_token`.
+    /// Cache a platform-provided OAuth bearer token for spclient requests.
     ///
-    /// `client_id` must be the OAuth client ID that issued `oauth_token`.
-    /// The Login5 `OneTimeToken` request sends this client_id to Spotify;
-    /// if it does not match the token's issuer, Spotify returns `INVALID_CREDENTIALS`.
-    ///
-    /// Using `OneTimeToken` is preferred over `StoredCredential` when the
-    /// session uses a third-party OAuth client ID, because AP-issued stored
-    /// credentials are bound to the client ID that obtained them and will
-    /// cause `INVALID_CREDENTIALS` from Login5 when a mismatched (non-Spotify)
-    /// client ID is used.
-    pub fn set_oauth_token(&self, oauth_token: impl Into<String>, client_id: impl Into<String>) {
-        let token = oauth_token.into();
-        let cid = client_id.into();
-        self.lock(|inner| {
-            inner.oauth_token = Some(token);
-            inner.oauth_client_id = Some(cid);
-            // Invalidate any cached auth_token so the next auth_token() call
-            // performs a fresh OneTimeToken exchange.
-            inner.auth_token = None;
-        });
-    }
-
-    /// Directly inject a pre-obtained OAuth access token to be used as the
-    /// Authorization Bearer token by spclient, bypassing the Login5 exchange.
-    ///
-    /// Use this when neither `OneTimeToken` nor `StoredCredential` Login5
-    /// exchanges work (e.g. when using a 3rd-party developer OAuth app whose
-    /// tokens are not accepted by Login5). The OAuth access token is cached
-    /// directly as the auth_token so that `auth_token()` returns it without
-    /// making any Login5 request.
-    ///
-    /// `expires_in_secs` is the remaining lifetime of the token in seconds;
-    /// pass 0 to use the default 3600s.
+    /// This bypasses Login5 only for callers that already hold a valid token
+    /// and cannot exchange it through Login5's stored-credential flow.
     pub fn inject_bearer_token(&self, access_token: impl Into<String>, expires_in_secs: u64) {
         use std::time::SystemTime;
+
         let token = Token {
             access_token: access_token.into(),
-            expires_in: std::time::Duration::from_secs(if expires_in_secs > 0 { expires_in_secs } else { 3600 }),
+            expires_in: std::time::Duration::from_secs(if expires_in_secs > 0 {
+                expires_in_secs
+            } else {
+                3600
+            }),
             token_type: "Bearer".to_string(),
             scopes: vec![
                 "streaming".to_string(),
@@ -117,10 +81,6 @@ impl Login5Manager {
         };
         self.lock(|inner| {
             inner.auth_token = Some(token);
-            // Clear the oauth_token so auth_token() returns the injected token
-            // rather than trying a Login5 OneTimeToken exchange.
-            inner.oauth_token = None;
-            inner.oauth_client_id = None;
         });
     }
 
@@ -229,55 +189,32 @@ impl Login5Manager {
 
     /// Retrieve the access_token via login5.
     ///
-    /// When an OAuth token is available (set via `set_oauth_token`), performs
-    /// a `OneTimeToken` exchange, which works with any valid Spotify OAuth
-    /// access token regardless of the OAuth client ID used.
-    ///
-    /// Otherwise falls back to `StoredCredential` exchange. This will only work
-    /// when the stored credentials match the session's client_id — e.g.
-    /// stored credentials generated with the keymaster client-id will not work
-    /// with the android client-id.
+    /// Returns an injected bearer token when one is available; otherwise uses
+    /// the stored credentials for a Login5 exchange.
     pub async fn auth_token(&self) -> Result<Token, Error> {
-        // Check the cache first (handles both OneTimeToken and StoredCredential paths).
-        let (cached_token, oauth_token, oauth_client_id) = self.lock(|inner| {
+        let cached_token = self.lock(|inner| {
             if let Some(token) = &inner.auth_token {
                 if token.is_expired() {
                     inner.auth_token = None;
                 }
             }
-            (
-                inner.auth_token.clone(),
-                inner.oauth_token.clone(),
-                inner.oauth_client_id.clone(),
-            )
+            inner.auth_token.clone()
         });
 
         if let Some(auth_token) = cached_token {
             return Ok(auth_token);
         }
 
-        let method = if let Some(ref raw_token) = oauth_token {
-            // Use the OneTimeToken method when a raw OAuth token is available.
-            // This avoids the INVALID_CREDENTIALS failure that occurs when the
-            // AP-issued stored credentials are exchanged with a third-party
-            // OAuth client ID — Spotify's Login5 rejects that combination.
-            debug!("Login5: using OneTimeToken exchange (client_id={:?})", oauth_client_id);
-            Login_method::OneTimeToken(OneTimeToken {
-                token: raw_token.clone(),
-                ..Default::default()
-            })
-        } else {
-            let auth_data = self.session().auth_data();
-            if auth_data.is_empty() {
-                return Err(Login5Error::NoStoredCredentials.into());
-            }
-            debug!("Login5: using StoredCredential exchange");
-            Login_method::StoredCredential(StoredCredential {
-                username: self.session().username().to_string(),
-                data: auth_data,
-                ..Default::default()
-            })
-        };
+        let auth_data = self.session().auth_data();
+        if auth_data.is_empty() {
+            return Err(Login5Error::NoStoredCredentials.into());
+        }
+        debug!("Login5: using StoredCredential exchange");
+        let method = Login_method::StoredCredential(StoredCredential {
+            username: self.session().username().to_string(),
+            data: auth_data,
+            ..Default::default()
+        });
 
         let token_response = self.login5_request(method).await?;
         let auth_token = Self::token_from_login(
