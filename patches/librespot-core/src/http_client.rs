@@ -10,7 +10,7 @@ use governor::{
     state::keyed::DefaultKeyedStateStore,
 };
 use http::{Uri, header::HeaderValue};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::{HeaderMap, Request, Response, StatusCode, body::Incoming, header::USER_AGENT};
 use hyper_proxy2::{Intercept, Proxy, ProxyConnector};
 use hyper_util::{
@@ -39,6 +39,8 @@ use crate::{
 pub const RATE_LIMIT_INTERVAL: Duration = Duration::from_secs(30);
 pub const RATE_LIMIT_MAX_WAIT: Duration = Duration::from_secs(10);
 pub const RATE_LIMIT_CALLS_PER_INTERVAL: u32 = 300;
+const MAX_ERROR_BODY_LOG_BYTES: usize = 512;
+const ERROR_BODY_LOG_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Error)]
 pub enum HttpClientError {
@@ -216,25 +218,35 @@ impl HttpClient {
                 // overhead and potential leakage of sensitive error payloads in
                 // production warn-level logs.
                 if log::log_enabled!(log::Level::Debug) {
-                    match response.into_body().collect().await {
-                        Ok(collected) => {
-                            let bytes = collected.to_bytes();
-                            let body_text = String::from_utf8_lossy(&bytes);
-                            const MAX_BODY_LOG: usize = 512;
-                            let truncated = if body_text.is_empty() {
+                    match tokio::time::timeout(
+                        ERROR_BODY_LOG_TIMEOUT,
+                        Limited::new(response.into_body(), MAX_ERROR_BODY_LOG_BYTES).collect(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(collected)) => {
+                            let body_bytes = collected.to_bytes();
+                            let body_text = String::from_utf8_lossy(&body_bytes);
+                            let body_text = if body_text.is_empty() {
                                 "<empty body>".to_string()
-                            } else if body_text.chars().count() > MAX_BODY_LOG {
-                                format!(
-                                    "{}… (truncated)",
-                                    body_text.chars().take(MAX_BODY_LOG).collect::<String>()
-                                )
                             } else {
                                 body_text.into_owned()
                             };
-                            debug!("HTTP {} for {} body: {}", code, uri, truncated);
+                            debug!("HTTP {} for {} body: {}", code, uri, body_text);
                         }
-                        Err(e) => {
-                            debug!("HTTP {} for {}: <failed to read body: {}>", code, uri, e);
+                        Ok(Err(error)) => {
+                            debug!(
+                                "HTTP {} for {}: <body omitted after {} bytes: {}>",
+                                code, uri, MAX_ERROR_BODY_LOG_BYTES, error
+                            );
+                        }
+                        Err(_) => {
+                            debug!(
+                                "HTTP {} for {}: <body read timed out after {} ms>",
+                                code,
+                                uri,
+                                ERROR_BODY_LOG_TIMEOUT.as_millis()
+                            );
                         }
                     }
                 }

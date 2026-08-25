@@ -119,6 +119,8 @@ name = "any_player_spotify_engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
+ "http",
  "librespot-core",
  "librespot-playback",
  "log",

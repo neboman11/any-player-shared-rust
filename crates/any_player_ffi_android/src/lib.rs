@@ -30,10 +30,6 @@ type SharedEngine = Arc<SpotifySessionEngine<AndroidSpotifyBackend>>;
 
 struct BridgeState {
     engine: Option<SharedEngine>,
-    // Last access token used for playback — stored so the session can be
-    // reconnected (e.g. after expiry or app restart) without requiring the
-    // caller to supply the token again.
-    playback_access_token: Option<String>,
     playback_volume_percent: u8,
     audio_normalization: AudioNormalizationSettings,
     adaptive_normalization: AdaptiveNormalizationState,
@@ -43,7 +39,6 @@ impl Default for BridgeState {
     fn default() -> Self {
         Self {
             engine: None,
-            playback_access_token: None,
             playback_volume_percent: 100,
             audio_normalization: AudioNormalizationSettings {
                 enabled: false,
@@ -422,13 +417,6 @@ fn handle_spotify_init_session(token_input: &str) -> String {
         Ok(engine) => engine,
         Err(error) => return error_response("bridge_not_initialized", error),
     };
-
-    // Persist the fresh, validated token so ensure_player_connected always has
-    // a current token after a re-auth, even before startQueue is called.
-    let access_token = token.access_token.clone();
-    if let Ok(mut state) = lock_state() {
-        state.playback_access_token = Some(access_token.clone());
-    }
 
     match PLAYBACK_RUNTIME.block_on(engine.initialize_with_token(token)) {
         Ok(()) => {
