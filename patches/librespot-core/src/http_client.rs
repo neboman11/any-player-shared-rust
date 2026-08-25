@@ -10,7 +10,7 @@ use governor::{
     state::keyed::DefaultKeyedStateStore,
 };
 use http::{Uri, header::HeaderValue};
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full};
 use hyper::{HeaderMap, Request, Response, StatusCode, body::Incoming, header::USER_AGENT};
 use hyper_proxy2::{Intercept, Proxy, ProxyConnector};
 use hyper_util::{
@@ -41,6 +41,45 @@ pub const RATE_LIMIT_MAX_WAIT: Duration = Duration::from_secs(10);
 pub const RATE_LIMIT_CALLS_PER_INTERVAL: u32 = 300;
 const MAX_ERROR_BODY_LOG_BYTES: usize = 512;
 const ERROR_BODY_LOG_TIMEOUT: Duration = Duration::from_millis(100);
+
+fn redacted_uri(uri: &Uri) -> String {
+    let authority = uri.authority().map(|authority| {
+        authority
+            .as_str()
+            .rsplit_once('@')
+            .map_or(authority.as_str(), |(_, authority)| authority)
+    });
+
+    match (uri.scheme_str(), authority) {
+        (Some(scheme), Some(authority)) => format!("{scheme}://{authority}{}", uri.path()),
+        (Some(scheme), None) => format!("{scheme}:{}", uri.path()),
+        (None, Some(authority)) => format!("//{authority}{}", uri.path()),
+        (None, None) => uri.path().to_owned(),
+    }
+}
+
+async fn collect_error_body(body: Incoming) -> Result<(Bytes, bool), hyper::Error> {
+    let mut body = body;
+    let mut bytes = Vec::with_capacity(MAX_ERROR_BODY_LOG_BYTES);
+
+    loop {
+        let Some(frame) = body.frame().await else {
+            return Ok((Bytes::from(bytes), false));
+        };
+        let frame = frame?;
+        let Some(data) = frame.data_ref() else {
+            continue;
+        };
+
+        let remaining = MAX_ERROR_BODY_LOG_BYTES - bytes.len();
+        let bytes_to_copy = remaining.min(data.len());
+        bytes.extend_from_slice(&data[..bytes_to_copy]);
+
+        if bytes_to_copy < data.len() {
+            return Ok((Bytes::from(bytes), true));
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum HttpClientError {
@@ -181,7 +220,7 @@ impl HttpClient {
     }
 
     pub async fn request(&self, req: Request<Bytes>) -> Result<Response<Incoming>, Error> {
-        debug!("Requesting {}", req.uri());
+        debug!("Requesting {}", redacted_uri(req.uri()));
 
         // `Request` does not implement `Clone` because its `Body` may be a single-shot stream.
         // As correct as that may be technically, we now need all this boilerplate to clone it
@@ -211,28 +250,34 @@ impl HttpClient {
                 }
             }
 
-            if !code.is_success() {
-                let uri = parts.uri.clone();
-                warn!("HTTP {} for {}", code, uri);
+        if !code.is_success() {
+            let uri = redacted_uri(&parts.uri);
+            warn!("HTTP {} for {}", code, uri);
                 // Only read and log the response body at debug level to avoid
                 // overhead and potential leakage of sensitive error payloads in
                 // production warn-level logs.
                 if log::log_enabled!(log::Level::Debug) {
-                    match tokio::time::timeout(
-                        ERROR_BODY_LOG_TIMEOUT,
-                        Limited::new(response.into_body(), MAX_ERROR_BODY_LOG_BYTES).collect(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(collected)) => {
-                            let body_bytes = collected.to_bytes();
-                            let body_text = String::from_utf8_lossy(&body_bytes);
-                            let body_text = if body_text.is_empty() {
-                                "<empty body>".to_string()
-                            } else {
-                                body_text.into_owned()
-                            };
+                match tokio::time::timeout(
+                    ERROR_BODY_LOG_TIMEOUT,
+                    collect_error_body(response.into_body()),
+                )
+                .await
+                {
+                    Ok(Ok((body_bytes, truncated))) => {
+                        let body_text = String::from_utf8_lossy(&body_bytes);
+                        let body_text = if body_text.is_empty() {
+                            "<empty body>".to_string()
+                        } else {
+                            body_text.into_owned()
+                        };
+                        if truncated {
+                            debug!(
+                                "HTTP {} for {} body: {} <truncated after {} bytes>",
+                                code, uri, body_text, MAX_ERROR_BODY_LOG_BYTES
+                            );
+                        } else {
                             debug!("HTTP {} for {} body: {}", code, uri, body_text);
+                        }
                         }
                         Ok(Err(error)) => {
                             debug!(

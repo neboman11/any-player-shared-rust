@@ -21,7 +21,6 @@ use tokio::time::{Duration, timeout};
 use url::form_urlencoded;
 
 struct BridgeState {
-    playback_volume_percent: u8,
     audio_normalization: AudioNormalizationSettings,
     adaptive_normalization: AdaptiveNormalizationState,
 }
@@ -29,7 +28,6 @@ struct BridgeState {
 impl Default for BridgeState {
     fn default() -> Self {
         Self {
-            playback_volume_percent: 100,
             audio_normalization: AudioNormalizationSettings {
                 enabled: false,
                 target: INTERNAL_NORMALIZATION_TARGET,
@@ -271,7 +269,7 @@ fn handle_set_audio_normalization_settings(config_json: &str) -> String {
         Err(error) => return error_response("invalid_audio_normalization_payload", error),
     };
 
-    let (requested_volume_percent, output_volume_percent) = {
+    {
         let mut state = match lock_state() {
             Ok(state) => state,
             Err(error) => return error_response("bridge_state_error", error),
@@ -280,22 +278,12 @@ fn handle_set_audio_normalization_settings(config_json: &str) -> String {
         state.audio_normalization.enabled = payload.enabled;
         state.audio_normalization.strict_mode = payload.strict_mode;
         state.audio_normalization.target = INTERNAL_NORMALIZATION_TARGET;
-
-        let output = normalized_volume_for_source(
-            state.playback_volume_percent as i32,
-            AudioNormalizationSource::Spotify,
-            &state.audio_normalization,
-            &state.adaptive_normalization,
-        );
-        (state.playback_volume_percent, output)
-    };
+    }
 
     success_response(json!({
         "enabled": payload.enabled,
         "strict_mode": payload.strict_mode,
         "target": INTERNAL_NORMALIZATION_TARGET,
-        "volume_percent": requested_volume_percent,
-        "output_volume_percent": output_volume_percent,
     }))
 }
 
@@ -770,12 +758,11 @@ mod tests {
     }
 
     #[test]
-    fn set_audio_normalization_settings_updates_state_and_returns_ok() {
+    fn set_audio_normalization_settings_updates_state_without_stale_volume_metadata() {
         let _guard = TEST_MUTEX.lock().expect("test mutex");
 
         {
             let mut state = lock_state().expect("lock_state");
-            state.playback_volume_percent = 50;
             state.audio_normalization.enabled = false;
             state.audio_normalization.strict_mode = false;
         }
@@ -790,7 +777,8 @@ mod tests {
             payload["data"]["target"],
             Value::Number(INTERNAL_NORMALIZATION_TARGET.into())
         );
-        assert_eq!(payload["data"]["volume_percent"], Value::Number(50.into()));
+        assert!(payload["data"].get("volume_percent").is_none());
+        assert!(payload["data"].get("output_volume_percent").is_none());
 
         let state = lock_state().expect("lock_state");
         assert!(state.audio_normalization.enabled);
