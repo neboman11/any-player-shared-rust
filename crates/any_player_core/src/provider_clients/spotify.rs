@@ -301,10 +301,7 @@ impl ProviderApi for SpotifyApiClient {
         let mut playlists = Vec::new();
         let mut offset = playlist_offset(session);
 
-        loop {
-            let Some(page_size) = playlist_page_size(offset, fetch_limit) else {
-                break;
-            };
+        while let Some(page_size) = playlist_page_size(offset, fetch_limit) {
             let response = self
                 .execute_json(
                     "me/playlists",
@@ -511,10 +508,7 @@ impl ProviderApi for SpotifyApiClient {
             return Ok(playlists);
         }
 
-        loop {
-            let Some(page_size) = playlist_page_size(offset, fetch_limit) else {
-                break;
-            };
+        while let Some(page_size) = playlist_page_size(offset, fetch_limit) {
             let response = self
                 .execute_json(
                     "search",
