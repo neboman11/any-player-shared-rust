@@ -1,6 +1,6 @@
 use any_player_core::audio_normalization::{
-    AdaptiveNormalizationState, AudioNormalizationSettings, AudioNormalizationSource,
-    INTERNAL_NORMALIZATION_TARGET, effective_output_volume,
+    AudioNormalizationSettings, AudioNormalizationSource, INTERNAL_NORMALIZATION_TARGET,
+    effective_output_volume,
 };
 use any_player_core::provider_api::ProviderApi;
 use any_player_core::provider_api::ProviderConnectionCheck;
@@ -22,7 +22,6 @@ use url::form_urlencoded;
 
 struct BridgeState {
     audio_normalization: AudioNormalizationSettings,
-    adaptive_normalization: AdaptiveNormalizationState,
 }
 
 impl Default for BridgeState {
@@ -33,7 +32,6 @@ impl Default for BridgeState {
                 target: INTERNAL_NORMALIZATION_TARGET,
                 strict_mode: false,
             },
-            adaptive_normalization: AdaptiveNormalizationState::default(),
         }
     }
 }
@@ -61,8 +59,10 @@ struct BeginAuthPayload {
 #[derive(Deserialize)]
 struct AudioNormalizationSettingsPayload {
     enabled: bool,
-    #[serde(default)]
-    strict_mode: bool,
+    // Retained to accept saved clients' payloads; strict normalization needs
+    // loudness measurements that this bridge does not receive.
+    #[serde(default, rename = "strict_mode")]
+    _strict_mode: bool,
 }
 
 #[derive(Deserialize)]
@@ -123,32 +123,13 @@ fn parse_normalization_source(source: Option<&str>) -> AudioNormalizationSource 
     }
 }
 
-fn strict_gain_for_source(
-    settings: &AudioNormalizationSettings,
-    adaptive_state: &AdaptiveNormalizationState,
-    source: AudioNormalizationSource,
-) -> f32 {
-    if !settings.strict_mode {
-        return 1.0;
-    }
-
-    let source_key = match source {
-        AudioNormalizationSource::Spotify => "spotify",
-        AudioNormalizationSource::Other => "other",
-    };
-
-    adaptive_state.strict_compensation_gain(source_key)
-}
-
 fn normalized_volume_for_source(
     base_volume_percent: i32,
     source: AudioNormalizationSource,
     settings: &AudioNormalizationSettings,
-    adaptive_state: &AdaptiveNormalizationState,
 ) -> u8 {
     let clamped_base = base_volume_percent.clamp(0, 100) as u32;
-    let strict_gain = strict_gain_for_source(settings, adaptive_state, source);
-    effective_output_volume(clamped_base, source, settings, strict_gain) as u8
+    effective_output_volume(clamped_base, source, settings, 1.0) as u8
 }
 
 fn parse_required_json<T>(raw_json: &str, field_name: &str) -> Result<T, String>
@@ -255,7 +236,7 @@ fn handle_get_audio_normalization_settings() -> String {
 
     success_response(json!({
         "enabled": state.audio_normalization.enabled,
-        "strict_mode": state.audio_normalization.strict_mode,
+        "strict_mode": false,
         "target": state.audio_normalization.target,
     }))
 }
@@ -276,13 +257,13 @@ fn handle_set_audio_normalization_settings(config_json: &str) -> String {
         };
 
         state.audio_normalization.enabled = payload.enabled;
-        state.audio_normalization.strict_mode = payload.strict_mode;
+        state.audio_normalization.strict_mode = false;
         state.audio_normalization.target = INTERNAL_NORMALIZATION_TARGET;
     }
 
     success_response(json!({
         "enabled": payload.enabled,
-        "strict_mode": payload.strict_mode,
+        "strict_mode": false,
         "target": INTERNAL_NORMALIZATION_TARGET,
     }))
 }
@@ -303,12 +284,7 @@ fn handle_apply_audio_normalization_volume(config_json: &str) -> String {
             Err(error) => return error_response("bridge_state_error", error),
         };
 
-        normalized_volume_for_source(
-            payload.volume_percent,
-            source,
-            &state.audio_normalization,
-            &state.adaptive_normalization,
-        )
+        normalized_volume_for_source(payload.volume_percent, source, &state.audio_normalization)
     };
 
     success_response(json!({
@@ -656,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn get_audio_normalization_settings_reflects_state() {
+    fn get_audio_normalization_settings_reports_strict_mode_as_unavailable() {
         let _guard = TEST_MUTEX.lock().expect("test mutex");
 
         {
@@ -669,7 +645,7 @@ mod tests {
         let payload = parse_json(&handle_get_audio_normalization_settings());
         assert_eq!(payload["ok"], Value::Bool(true));
         assert_eq!(payload["data"]["enabled"], Value::Bool(true));
-        assert_eq!(payload["data"]["strict_mode"], Value::Bool(true));
+        assert_eq!(payload["data"]["strict_mode"], Value::Bool(false));
         assert_eq!(
             payload["data"]["target"],
             Value::Number(INTERNAL_NORMALIZATION_TARGET.into())
@@ -677,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn set_audio_normalization_settings_updates_state_without_stale_volume_metadata() {
+    fn set_audio_normalization_settings_disables_unsupported_strict_mode() {
         let _guard = TEST_MUTEX.lock().expect("test mutex");
 
         {
@@ -691,7 +667,7 @@ mod tests {
         ));
         assert_eq!(payload["ok"], Value::Bool(true));
         assert_eq!(payload["data"]["enabled"], Value::Bool(true));
-        assert_eq!(payload["data"]["strict_mode"], Value::Bool(true));
+        assert_eq!(payload["data"]["strict_mode"], Value::Bool(false));
         assert_eq!(
             payload["data"]["target"],
             Value::Number(INTERNAL_NORMALIZATION_TARGET.into())
@@ -701,7 +677,7 @@ mod tests {
 
         let state = lock_state().expect("lock_state");
         assert!(state.audio_normalization.enabled);
-        assert!(state.audio_normalization.strict_mode);
+        assert!(!state.audio_normalization.strict_mode);
     }
 
     #[test]
