@@ -30,7 +30,6 @@ impl Default for BridgeState {
             audio_normalization: AudioNormalizationSettings {
                 enabled: false,
                 target: INTERNAL_NORMALIZATION_TARGET,
-                strict_mode: false,
             },
         }
     }
@@ -129,7 +128,7 @@ fn normalized_volume_for_source(
     settings: &AudioNormalizationSettings,
 ) -> u8 {
     let clamped_base = base_volume_percent.clamp(0, 100) as u32;
-    effective_output_volume(clamped_base, source, settings, 1.0) as u8
+    effective_output_volume(clamped_base, source, settings) as u8
 }
 
 fn parse_required_json<T>(raw_json: &str, field_name: &str) -> Result<T, String>
@@ -163,8 +162,7 @@ fn handle_spotify_begin_auth(config_json: &str) -> String {
     serializer.append_pair("client_id", client_id);
     serializer.append_pair("redirect_uri", redirect_uri);
 
-    let mut seen_scopes = HashSet::new();
-    let supplied_scopes = payload
+    let requested_scopes = payload
         .scopes
         .into_iter()
         .flat_map(|scope| {
@@ -173,10 +171,23 @@ fn handle_spotify_begin_auth(config_json: &str) -> String {
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         })
+        .collect::<Vec<_>>();
+    let has_requested_scopes = !requested_scopes.is_empty();
+
+    let mut seen_scopes = HashSet::new();
+    let supplied_scopes = requested_scopes
+        .into_iter()
         .filter(|scope| !scope.eq_ignore_ascii_case("streaming"))
         .filter(|scope| seen_scopes.insert(scope.to_ascii_lowercase()))
         .collect::<Vec<_>>();
     let scopes = if supplied_scopes.is_empty() {
+        if has_requested_scopes {
+            return error_response(
+                "spotify_scopes_empty_after_filtering",
+                "All requested Spotify scopes are unsupported",
+            );
+        }
+
         vec![
             "user-modify-playback-state".to_string(),
             "user-read-playback-state".to_string(),
@@ -269,7 +280,6 @@ fn handle_set_audio_normalization_settings(config_json: &str) -> String {
         };
 
         state.audio_normalization.enabled = payload.enabled;
-        state.audio_normalization.strict_mode = false;
         state.audio_normalization.target = INTERNAL_NORMALIZATION_TARGET;
     }
 
@@ -675,6 +685,21 @@ mod tests {
     }
 
     #[test]
+    fn spotify_begin_auth_rejects_scopes_that_are_only_obsolete_streaming() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        let payload = parse_json(&handle_spotify_begin_auth(
+            r#"{"client_id":"test-client","redirect_uri":"any-player://callback","scopes":["streaming"]}"#,
+        ));
+
+        assert_eq!(payload["ok"], Value::Bool(false));
+        assert_eq!(
+            payload["error"]["code"],
+            Value::String("spotify_scopes_empty_after_filtering".to_string())
+        );
+    }
+
+    #[test]
     fn spotify_exchange_code_reports_platform_auth_required() {
         let _guard = TEST_MUTEX.lock().expect("test mutex");
 
@@ -695,7 +720,6 @@ mod tests {
         {
             let mut state = lock_state().expect("lock_state");
             state.audio_normalization.enabled = true;
-            state.audio_normalization.strict_mode = true;
             state.audio_normalization.target = INTERNAL_NORMALIZATION_TARGET;
         }
 
@@ -716,7 +740,6 @@ mod tests {
         {
             let mut state = lock_state().expect("lock_state");
             state.audio_normalization.enabled = false;
-            state.audio_normalization.strict_mode = false;
         }
 
         let payload = parse_json(&handle_set_audio_normalization_settings(
@@ -734,7 +757,6 @@ mod tests {
 
         let state = lock_state().expect("lock_state");
         assert!(state.audio_normalization.enabled);
-        assert!(!state.audio_normalization.strict_mode);
     }
 
     #[test]
@@ -744,7 +766,6 @@ mod tests {
         {
             let mut state = lock_state().expect("lock_state");
             state.audio_normalization.enabled = true;
-            state.audio_normalization.strict_mode = false;
             state.audio_normalization.target = INTERNAL_NORMALIZATION_TARGET;
         }
 
