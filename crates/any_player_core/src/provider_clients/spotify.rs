@@ -8,9 +8,23 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 const SPOTIFY_API_BASE_URL: &str = "https://api.spotify.com/v1";
+const SPOTIFY_PLAYLIST_PAGE_SIZE: usize = 50;
+
+fn next_playlist_offset(offset: usize, page_len: usize, total: Option<usize>) -> Option<usize> {
+    if page_len == 0 {
+        return None;
+    }
+
+    let next_offset = offset.checked_add(page_len)?;
+    match total {
+        Some(total) => (next_offset < total).then_some(next_offset),
+        None => (page_len == SPOTIFY_PLAYLIST_PAGE_SIZE).then_some(next_offset),
+    }
+}
 
 pub struct SpotifyApiClient {
     client: Client,
+    api_base_url: String,
 }
 
 impl Default for SpotifyApiClient {
@@ -23,11 +37,23 @@ impl SpotifyApiClient {
     pub fn new() -> Self {
         Self {
             client: Client::new(),
+            api_base_url: SPOTIFY_API_BASE_URL.to_string(),
         }
     }
 
     pub fn with_client(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            api_base_url: SPOTIFY_API_BASE_URL.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_client_and_base_url(client: Client, api_base_url: String) -> Self {
+        Self {
+            client,
+            api_base_url: api_base_url.trim_end_matches('/').to_string(),
+        }
     }
 
     fn require_access_token(session: &ProviderAuthRequest) -> Result<&str, ProviderError> {
@@ -63,7 +89,7 @@ impl SpotifyApiClient {
         query: &[(String, String)],
     ) -> Result<Value, ProviderError> {
         let endpoint = path.trim_start_matches('/');
-        let url = format!("{}/{}", SPOTIFY_API_BASE_URL, endpoint);
+        let url = format!("{}/{}", self.api_base_url, endpoint);
         let mut request = self
             .client
             .get(url)
@@ -241,24 +267,39 @@ impl ProviderApi for SpotifyApiClient {
         session: &ProviderAuthRequest,
     ) -> Result<Vec<Playlist>, ProviderError> {
         let token = Self::require_access_token(session)?;
-        let response = self
-            .execute_json(
-                "me/playlists",
-                token,
-                &[("limit".to_string(), "50".to_string())],
-            )
-            .await?;
+        let mut playlists = Vec::new();
+        let mut offset = 0;
 
-        Ok(response
-            .get("items")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Self::parse_playlist)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default())
+        loop {
+            let response = self
+                .execute_json(
+                    "me/playlists",
+                    token,
+                    &[
+                        ("limit".to_string(), SPOTIFY_PLAYLIST_PAGE_SIZE.to_string()),
+                        ("offset".to_string(), offset.to_string()),
+                    ],
+                )
+                .await?;
+            let items = response
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let page_len = items.len();
+            playlists.extend(items.iter().filter_map(Self::parse_playlist));
+
+            let total = response
+                .get("total")
+                .and_then(Value::as_u64)
+                .and_then(|total| usize::try_from(total).ok());
+            let Some(next_offset) = next_playlist_offset(offset, page_len, total) else {
+                break;
+            };
+            offset = next_offset;
+        }
+
+        Ok(playlists)
     }
 
     async fn get_playlist(
@@ -462,5 +503,128 @@ impl ProviderApi for SpotifyApiClient {
         }
 
         Ok(format!("spotify:track:{}", normalized))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SpotifyApiClient, next_playlist_offset};
+    use crate::provider_api::ProviderApi;
+    use crate::providers::ProviderAuthRequest;
+    use reqwest::Client;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn playlist_page(offset: usize, count: usize, total: usize) -> String {
+        let items = (offset..offset + count)
+            .map(|index| {
+                json!({
+                    "id": format!("playlist-{index}"),
+                    "name": format!("Playlist {index}"),
+                    "owner": { "display_name": "Test owner" },
+                    "tracks": { "total": 0 },
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({ "items": items, "total": total }).to_string()
+    }
+
+    fn start_playlist_test_server(
+        responses: Vec<String>,
+    ) -> (String, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("server address")
+        );
+        let server = thread::spawn(move || {
+            responses
+                .into_iter()
+                .map(|body| {
+                    let (mut stream, _) = listener.accept().expect("accept request");
+                    let mut request = Vec::new();
+                    loop {
+                        let mut buffer = [0; 1024];
+                        let read = stream.read(&mut buffer).expect("read request");
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request_line = String::from_utf8_lossy(&request)
+                        .lines()
+                        .next()
+                        .expect("request line")
+                        .to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .expect("write response");
+                    request_line
+                })
+                .collect()
+        });
+        (base_url, server)
+    }
+
+    #[test]
+    fn playlist_pagination_advances_until_the_reported_total() {
+        assert_eq!(next_playlist_offset(0, 50, Some(120)), Some(50));
+        assert_eq!(next_playlist_offset(50, 50, Some(120)), Some(100));
+        assert_eq!(next_playlist_offset(100, 10, Some(120)), Some(110));
+        assert_eq!(next_playlist_offset(100, 20, Some(120)), None);
+    }
+
+    #[test]
+    fn playlist_pagination_stops_on_a_short_or_empty_page_without_total() {
+        assert_eq!(next_playlist_offset(0, 49, None), None);
+        assert_eq!(next_playlist_offset(0, 0, None), None);
+        assert_eq!(next_playlist_offset(0, 50, None), Some(50));
+    }
+
+    #[test]
+    fn get_playlists_fetches_and_aggregates_every_spotify_page() {
+        let (base_url, server) = start_playlist_test_server(vec![
+            playlist_page(0, 50, 101),
+            playlist_page(50, 50, 101),
+            playlist_page(100, 1, 101),
+        ]);
+        let client = SpotifyApiClient::with_client_and_base_url(Client::new(), base_url);
+        let session = ProviderAuthRequest::new(HashMap::from([(
+            "access_token".to_string(),
+            "test-token".to_string(),
+        )]));
+        let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+
+        let playlists = runtime
+            .block_on(client.get_playlists(&session))
+            .expect("fetch playlists");
+
+        assert_eq!(playlists.len(), 101);
+        assert_eq!(
+            playlists.first().map(|playlist| playlist.id.as_str()),
+            Some("playlist-0")
+        );
+        assert_eq!(
+            playlists.last().map(|playlist| playlist.id.as_str()),
+            Some("playlist-100")
+        );
+
+        let paths = server.join().expect("test server should finish");
+        assert_eq!(paths.len(), 3);
+        for (index, offset) in [0, 50, 100].into_iter().enumerate() {
+            assert!(paths[index].starts_with("GET /v1/me/playlists?"));
+            assert!(paths[index].contains("limit=50"));
+            assert!(paths[index].contains(&format!("offset={offset}")));
+        }
     }
 }

@@ -14,7 +14,7 @@ use jni::sys::jstring;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{Duration, timeout};
@@ -163,7 +163,20 @@ fn handle_spotify_begin_auth(config_json: &str) -> String {
     serializer.append_pair("client_id", client_id);
     serializer.append_pair("redirect_uri", redirect_uri);
 
-    let scopes = if payload.scopes.is_empty() {
+    let mut seen_scopes = HashSet::new();
+    let supplied_scopes = payload
+        .scopes
+        .into_iter()
+        .flat_map(|scope| {
+            scope
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|scope| !scope.eq_ignore_ascii_case("streaming"))
+        .filter(|scope| seen_scopes.insert(scope.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+    let scopes = if supplied_scopes.is_empty() {
         vec![
             "user-modify-playback-state".to_string(),
             "user-read-playback-state".to_string(),
@@ -171,7 +184,7 @@ fn handle_spotify_begin_auth(config_json: &str) -> String {
             "user-read-private".to_string(),
         ]
     } else {
-        payload.scopes
+        supplied_scopes
     };
     serializer.append_pair("scope", &scopes.join(" "));
 
@@ -641,11 +654,11 @@ mod tests {
     }
 
     #[test]
-    fn spotify_begin_auth_preserves_supplied_scopes() {
+    fn spotify_begin_auth_excludes_obsolete_streaming_scope() {
         let _guard = TEST_MUTEX.lock().expect("test mutex");
 
         let payload = parse_json(&handle_spotify_begin_auth(
-            r#"{"client_id":"test-client","redirect_uri":"any-player://callback","scopes":["playlist-read-private","user-read-email"]}"#,
+            r#"{"client_id":"test-client","redirect_uri":"any-player://callback","scopes":["playlist-read-private streaming user-read-email"]}"#,
         ));
         assert_eq!(payload["ok"], Value::Bool(true));
 
