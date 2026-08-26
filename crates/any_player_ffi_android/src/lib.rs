@@ -2,10 +2,16 @@ use any_player_core::audio_normalization::{
     AudioNormalizationSettings, AudioNormalizationSource, INTERNAL_NORMALIZATION_TARGET,
     effective_output_volume,
 };
+use any_player_core::models::Source;
 use any_player_core::provider_api::ProviderApi;
 use any_player_core::provider_api::ProviderConnectionCheck;
 use any_player_core::provider_clients::{
-    jellyfin::JellyfinApiClient, plex::PlexApiClient, spotify::SpotifyApiClient,
+    jellyfin::JellyfinApiClient,
+    plex::PlexApiClient,
+    spotify::{
+        SPOTIFY_PLAYLIST_FETCH_LIMIT_SESSION_PARAM, SPOTIFY_PLAYLIST_OFFSET_SESSION_PARAM,
+        SpotifyApiClient,
+    },
 };
 use any_player_core::providers::ProviderAuthRequest;
 use jni::JNIEnv;
@@ -193,6 +199,8 @@ fn handle_spotify_begin_auth(config_json: &str) -> String {
             "user-read-playback-state".to_string(),
             "user-read-email".to_string(),
             "user-read-private".to_string(),
+            "playlist-read-private".to_string(),
+            "playlist-read-collaborative".to_string(),
         ]
     } else {
         supplied_scopes
@@ -380,7 +388,12 @@ async fn dispatch_provider_operation(
                         .to_string()
                 })?
                 .map_err(|error| error.0)?;
-            Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
+            let page_offset = if client.source() == Source::Spotify {
+                0
+            } else {
+                offset
+            };
+            Ok(json!({ "playlists": json_value(page_slice(playlists, page_offset, limit))? }))
         }
         "get_playlist" => {
             let id = require_field(payload.id.clone(), "id")?;
@@ -425,7 +438,12 @@ async fn dispatch_provider_operation(
                     .to_string()
             })?
             .map_err(|error| error.0)?;
-            Ok(json!({ "playlists": json_value(page_slice(playlists, offset, limit))? }))
+            let page_offset = if client.source() == Source::Spotify {
+                0
+            } else {
+                offset
+            };
+            Ok(json!({ "playlists": json_value(page_slice(playlists, page_offset, limit))? }))
         }
         "get_recently_played" => {
             let tracks = timeout(
@@ -447,9 +465,11 @@ async fn dispatch_provider_operation(
 
 /// Clamps `limit` to `1..=1000` (defaulting to 300 when absent) and ensures
 /// `page_size` is present in `session`, deriving it from `limit` when absent.
-/// This keeps provider pagination aligned with the requested limit.
+/// It also caps playlist aggregation at `offset + limit`, so providers do not
+/// fetch pages the FFI will discard.
 fn prepare_provider_call(
     session: HashMap<String, String>,
+    offset: usize,
     limit: Option<usize>,
 ) -> (HashMap<String, String>, usize) {
     // Limit is now configurable via the request (e.g., from Android's configured page size).
@@ -462,6 +482,14 @@ fn prepare_provider_call(
     session
         .entry("page_size".to_string())
         .or_insert_with(|| limit.to_string());
+    session.insert(
+        SPOTIFY_PLAYLIST_FETCH_LIMIT_SESSION_PARAM.to_string(),
+        offset.saturating_add(limit).to_string(),
+    );
+    session.insert(
+        SPOTIFY_PLAYLIST_OFFSET_SESSION_PARAM.to_string(),
+        offset.to_string(),
+    );
 
     (session, limit)
 }
@@ -477,7 +505,8 @@ fn handle_provider_api_call(config_json: &str) -> String {
     let operation = payload.operation.trim().to_ascii_lowercase();
     let offset = payload.offset.unwrap_or(0);
 
-    let (session_map, limit) = prepare_provider_call(payload.session.clone(), payload.limit);
+    let (session_map, limit) =
+        prepare_provider_call(payload.session.clone(), offset, payload.limit);
     let session = ProviderAuthRequest::new(session_map);
 
     let result: Result<Value, String> = TOKIO_RUNTIME.block_on(async {
@@ -659,7 +688,7 @@ mod tests {
 
         assert_eq!(
             scope,
-            "user-modify-playback-state user-read-playback-state user-read-email user-read-private"
+            "user-modify-playback-state user-read-playback-state user-read-email user-read-private playlist-read-private playlist-read-collaborative"
         );
     }
 
@@ -848,39 +877,45 @@ mod tests {
 
     #[test]
     fn prepare_provider_call_defaults_limit_to_300_and_sets_page_size() {
-        let (session, limit) = prepare_provider_call(HashMap::new(), None);
+        let (session, limit) = prepare_provider_call(HashMap::new(), 0, None);
         assert_eq!(limit, 300);
         assert_eq!(session["page_size"], "300");
+        assert_eq!(session[SPOTIFY_PLAYLIST_FETCH_LIMIT_SESSION_PARAM], "300");
     }
 
     #[test]
     fn prepare_provider_call_uses_provided_limit_as_page_size() {
-        let (session, limit) = prepare_provider_call(HashMap::new(), Some(500));
+        let (session, limit) = prepare_provider_call(HashMap::new(), 0, Some(500));
         assert_eq!(limit, 500);
         assert_eq!(session["page_size"], "500");
+        assert_eq!(session[SPOTIFY_PLAYLIST_FETCH_LIMIT_SESSION_PARAM], "500");
     }
 
     #[test]
     fn prepare_provider_call_clamps_limit_to_max_1000() {
-        let (session, limit) = prepare_provider_call(HashMap::new(), Some(2000));
+        let (session, limit) = prepare_provider_call(HashMap::new(), 0, Some(2000));
         assert_eq!(limit, 1000);
         assert_eq!(session["page_size"], "1000");
+        assert_eq!(session[SPOTIFY_PLAYLIST_FETCH_LIMIT_SESSION_PARAM], "1000");
     }
 
     #[test]
     fn prepare_provider_call_clamps_limit_to_min_1() {
-        let (session, limit) = prepare_provider_call(HashMap::new(), Some(0));
+        let (session, limit) = prepare_provider_call(HashMap::new(), 0, Some(0));
         assert_eq!(limit, 1);
         assert_eq!(session["page_size"], "1");
+        assert_eq!(session[SPOTIFY_PLAYLIST_FETCH_LIMIT_SESSION_PARAM], "1");
     }
 
     #[test]
     fn prepare_provider_call_preserves_existing_page_size_in_session() {
         let mut existing_session = HashMap::new();
         existing_session.insert("page_size".to_string(), "50".to_string());
-        let (session, limit) = prepare_provider_call(existing_session, Some(200));
+        let (session, limit) = prepare_provider_call(existing_session, 50, Some(200));
         assert_eq!(limit, 200);
         // page_size from the caller's session must not be overridden
         assert_eq!(session["page_size"], "50");
+        assert_eq!(session[SPOTIFY_PLAYLIST_OFFSET_SESSION_PARAM], "50");
+        assert_eq!(session[SPOTIFY_PLAYLIST_FETCH_LIMIT_SESSION_PARAM], "250");
     }
 }

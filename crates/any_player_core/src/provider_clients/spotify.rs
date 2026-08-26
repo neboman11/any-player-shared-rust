@@ -9,6 +9,11 @@ use std::collections::HashMap;
 
 const SPOTIFY_API_BASE_URL: &str = "https://api.spotify.com/v1";
 const SPOTIFY_PLAYLIST_PAGE_SIZE: usize = 50;
+const SPOTIFY_SEARCH_MAX_OFFSET: usize = 1_000;
+/// Session parameter that caps playlist aggregation for paginated callers.
+pub const SPOTIFY_PLAYLIST_FETCH_LIMIT_SESSION_PARAM: &str = "playlist_fetch_limit";
+/// Session parameter that selects the first playlist for paginated callers.
+pub const SPOTIFY_PLAYLIST_OFFSET_SESSION_PARAM: &str = "playlist_offset";
 
 fn next_playlist_offset(offset: usize, page_len: usize, total: Option<usize>) -> Option<usize> {
     if page_len == 0 {
@@ -20,6 +25,31 @@ fn next_playlist_offset(offset: usize, page_len: usize, total: Option<usize>) ->
         Some(total) => (next_offset < total).then_some(next_offset),
         None => (page_len == SPOTIFY_PLAYLIST_PAGE_SIZE).then_some(next_offset),
     }
+}
+
+fn playlist_fetch_limit(session: &ProviderAuthRequest) -> Option<usize> {
+    session
+        .get(SPOTIFY_PLAYLIST_FETCH_LIMIT_SESSION_PARAM)
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+}
+
+fn playlist_offset(session: &ProviderAuthRequest) -> usize {
+    session
+        .get(SPOTIFY_PLAYLIST_OFFSET_SESSION_PARAM)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+fn playlist_page_size(offset: usize, fetch_limit: Option<usize>) -> Option<usize> {
+    let page_size = fetch_limit
+        .map(|limit| limit.saturating_sub(offset).min(SPOTIFY_PLAYLIST_PAGE_SIZE))
+        .unwrap_or(SPOTIFY_PLAYLIST_PAGE_SIZE);
+    (page_size > 0).then_some(page_size)
+}
+
+fn is_within_fetch_limit(next_offset: usize, fetch_limit: Option<usize>) -> bool {
+    fetch_limit.is_none_or(|limit| next_offset < limit)
 }
 
 pub struct SpotifyApiClient {
@@ -267,16 +297,20 @@ impl ProviderApi for SpotifyApiClient {
         session: &ProviderAuthRequest,
     ) -> Result<Vec<Playlist>, ProviderError> {
         let token = Self::require_access_token(session)?;
+        let fetch_limit = playlist_fetch_limit(session);
         let mut playlists = Vec::new();
-        let mut offset = 0;
+        let mut offset = playlist_offset(session);
 
         loop {
+            let Some(page_size) = playlist_page_size(offset, fetch_limit) else {
+                break;
+            };
             let response = self
                 .execute_json(
                     "me/playlists",
                     token,
                     &[
-                        ("limit".to_string(), SPOTIFY_PLAYLIST_PAGE_SIZE.to_string()),
+                        ("limit".to_string(), page_size.to_string()),
                         ("offset".to_string(), offset.to_string()),
                     ],
                 )
@@ -296,6 +330,9 @@ impl ProviderApi for SpotifyApiClient {
             let Some(next_offset) = next_playlist_offset(offset, page_len, total) else {
                 break;
             };
+            if !is_within_fetch_limit(next_offset, fetch_limit) {
+                break;
+            }
             offset = next_offset;
         }
 
@@ -467,10 +504,17 @@ impl ProviderApi for SpotifyApiClient {
             return Ok(Vec::new());
         }
 
+        let fetch_limit = playlist_fetch_limit(session);
         let mut playlists = Vec::new();
-        let mut offset = 0;
+        let mut offset = playlist_offset(session);
+        if offset > SPOTIFY_SEARCH_MAX_OFFSET {
+            return Ok(playlists);
+        }
 
         loop {
+            let Some(page_size) = playlist_page_size(offset, fetch_limit) else {
+                break;
+            };
             let response = self
                 .execute_json(
                     "search",
@@ -478,7 +522,7 @@ impl ProviderApi for SpotifyApiClient {
                     &[
                         ("q".to_string(), normalized.to_string()),
                         ("type".to_string(), "playlist".to_string()),
-                        ("limit".to_string(), SPOTIFY_PLAYLIST_PAGE_SIZE.to_string()),
+                        ("limit".to_string(), page_size.to_string()),
                         ("offset".to_string(), offset.to_string()),
                     ],
                 )
@@ -506,6 +550,11 @@ impl ProviderApi for SpotifyApiClient {
             let Some(next_offset) = next_playlist_offset(offset, page_len, total) else {
                 break;
             };
+            if next_offset > SPOTIFY_SEARCH_MAX_OFFSET
+                || !is_within_fetch_limit(next_offset, fetch_limit)
+            {
+                break;
+            }
             offset = next_offset;
         }
 
@@ -528,7 +577,11 @@ impl ProviderApi for SpotifyApiClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{SpotifyApiClient, next_playlist_offset};
+    use super::{
+        SPOTIFY_PLAYLIST_FETCH_LIMIT_SESSION_PARAM, SPOTIFY_PLAYLIST_OFFSET_SESSION_PARAM,
+        SPOTIFY_PLAYLIST_PAGE_SIZE, SPOTIFY_SEARCH_MAX_OFFSET, SpotifyApiClient,
+        next_playlist_offset,
+    };
     use crate::provider_api::ProviderApi;
     use crate::providers::ProviderAuthRequest;
     use reqwest::Client;
@@ -699,6 +752,62 @@ mod tests {
     }
 
     #[test]
+    fn get_playlists_stops_at_the_ffi_playlist_fetch_limit() {
+        let (base_url, server) = start_playlist_test_server(vec![playlist_page(0, 50, 101)]);
+        let client = SpotifyApiClient::with_client_and_base_url(Client::new(), base_url);
+        let session = ProviderAuthRequest::new(HashMap::from([
+            ("access_token".to_string(), "test-token".to_string()),
+            (
+                SPOTIFY_PLAYLIST_FETCH_LIMIT_SESSION_PARAM.to_string(),
+                "50".to_string(),
+            ),
+        ]));
+
+        let playlists = tokio::runtime::Runtime::new()
+            .expect("create runtime")
+            .block_on(client.get_playlists(&session))
+            .expect("fetch the first FFI playlist page only");
+        let paths = server.join().expect("test server should finish");
+
+        assert_eq!(playlists.len(), 50);
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].starts_with("GET /v1/me/playlists?"));
+        assert!(paths[0].contains("limit=50"));
+        assert!(paths[0].contains("offset=0"));
+    }
+
+    #[test]
+    fn get_playlists_starts_at_the_ffi_playlist_offset() {
+        let (base_url, server) = start_playlist_test_server(vec![playlist_page(100, 50, 150)]);
+        let client = SpotifyApiClient::with_client_and_base_url(Client::new(), base_url);
+        let session = ProviderAuthRequest::new(HashMap::from([
+            ("access_token".to_string(), "test-token".to_string()),
+            (
+                SPOTIFY_PLAYLIST_FETCH_LIMIT_SESSION_PARAM.to_string(),
+                "150".to_string(),
+            ),
+            (
+                SPOTIFY_PLAYLIST_OFFSET_SESSION_PARAM.to_string(),
+                "100".to_string(),
+            ),
+        ]));
+
+        let playlists = tokio::runtime::Runtime::new()
+            .expect("create runtime")
+            .block_on(client.get_playlists(&session))
+            .expect("fetch only the requested FFI playlist page");
+        let paths = server.join().expect("test server should finish");
+
+        assert_eq!(playlists.len(), 50);
+        assert_eq!(
+            playlists.first().map(|playlist| playlist.id.as_str()),
+            Some("playlist-100")
+        );
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].contains("offset=100"));
+    }
+
+    #[test]
     fn search_playlists_fetches_and_aggregates_every_spotify_page() {
         let (base_url, server) = start_playlist_test_server(vec![
             search_playlist_page(0, 50, 101),
@@ -733,6 +842,95 @@ mod tests {
             assert!(paths[index].contains("limit=50"));
             assert!(paths[index].contains(&format!("offset={offset}")));
         }
+    }
+
+    #[test]
+    fn search_playlists_never_requests_an_offset_above_spotify_maximum() {
+        let responses = (0..=1_000)
+            .step_by(SPOTIFY_PLAYLIST_PAGE_SIZE)
+            .map(|offset| search_playlist_page(offset, SPOTIFY_PLAYLIST_PAGE_SIZE, 1_100))
+            .collect();
+        let (base_url, server) = start_playlist_test_server(responses);
+        let client = SpotifyApiClient::with_client_and_base_url(Client::new(), base_url);
+        let session = ProviderAuthRequest::new(HashMap::from([(
+            "access_token".to_string(),
+            "test-token".to_string(),
+        )]));
+
+        let playlists = tokio::runtime::Runtime::new()
+            .expect("create runtime")
+            .block_on(client.search_playlists(&session, "morning mix"))
+            .expect("search playlists without exceeding Spotify's offset maximum");
+        let paths = server.join().expect("test server should finish");
+
+        assert_eq!(playlists.len(), 1_050);
+        assert_eq!(paths.len(), 21);
+        for (index, offset) in (0..=1_000).step_by(SPOTIFY_PLAYLIST_PAGE_SIZE).enumerate() {
+            assert!(paths[index].starts_with("GET /v1/search?"));
+            assert!(paths[index].contains(&format!("offset={offset}")));
+        }
+        assert!(
+            paths
+                .last()
+                .is_some_and(|path| path.contains("offset=1000"))
+        );
+    }
+
+    #[test]
+    fn search_playlists_rejects_an_initial_offset_above_spotify_maximum() {
+        let (base_url, server) = start_playlist_test_server(Vec::new());
+        let client = SpotifyApiClient::with_client_and_base_url(Client::new(), base_url);
+        let session = ProviderAuthRequest::new(HashMap::from([
+            ("access_token".to_string(), "test-token".to_string()),
+            (
+                SPOTIFY_PLAYLIST_FETCH_LIMIT_SESSION_PARAM.to_string(),
+                (SPOTIFY_SEARCH_MAX_OFFSET + 51).to_string(),
+            ),
+            (
+                SPOTIFY_PLAYLIST_OFFSET_SESSION_PARAM.to_string(),
+                (SPOTIFY_SEARCH_MAX_OFFSET + 1).to_string(),
+            ),
+        ]));
+
+        let playlists = tokio::runtime::Runtime::new()
+            .expect("create runtime")
+            .block_on(client.search_playlists(&session, "morning mix"))
+            .expect("reject an unsupported Spotify Search offset without a request");
+
+        assert!(playlists.is_empty());
+        assert!(server.join().expect("test server should finish").is_empty());
+    }
+
+    #[test]
+    fn search_playlists_starts_at_the_ffi_playlist_offset() {
+        let (base_url, server) =
+            start_playlist_test_server(vec![search_playlist_page(100, 50, 150)]);
+        let client = SpotifyApiClient::with_client_and_base_url(Client::new(), base_url);
+        let session = ProviderAuthRequest::new(HashMap::from([
+            ("access_token".to_string(), "test-token".to_string()),
+            (
+                SPOTIFY_PLAYLIST_FETCH_LIMIT_SESSION_PARAM.to_string(),
+                "150".to_string(),
+            ),
+            (
+                SPOTIFY_PLAYLIST_OFFSET_SESSION_PARAM.to_string(),
+                "100".to_string(),
+            ),
+        ]));
+
+        let playlists = tokio::runtime::Runtime::new()
+            .expect("create runtime")
+            .block_on(client.search_playlists(&session, "morning mix"))
+            .expect("search only the requested FFI playlist page");
+        let paths = server.join().expect("test server should finish");
+
+        assert_eq!(playlists.len(), 50);
+        assert_eq!(
+            playlists.first().map(|playlist| playlist.id.as_str()),
+            Some("playlist-100")
+        );
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].contains("offset=100"));
     }
 
     #[test]
