@@ -17,16 +17,6 @@ Shared Rust workspace for Any Player platform integrations (desktop + Android), 
 ## Prerequisites
 
 - Rust stable toolchain
-- On Linux (for native desktop-style builds that pull audio deps):
-  - `pkg-config`
-  - `libasound2-dev`
-
-Example:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y pkg-config libasound2-dev
-```
 
 ## Common commands
 
