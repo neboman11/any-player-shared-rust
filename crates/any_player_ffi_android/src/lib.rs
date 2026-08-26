@@ -165,7 +165,6 @@ fn handle_spotify_begin_auth(config_json: &str) -> String {
 
     let scopes = if payload.scopes.is_empty() {
         vec![
-            "streaming".to_string(),
             "user-modify-playback-state".to_string(),
             "user-read-playback-state".to_string(),
             "user-read-email".to_string(),
@@ -615,6 +614,51 @@ mod tests {
 
     fn parse_json(payload: &str) -> Value {
         serde_json::from_str(payload).expect("expected valid json response")
+    }
+
+    #[test]
+    fn spotify_begin_auth_defaults_to_connect_scopes() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        let payload = parse_json(&handle_spotify_begin_auth(
+            r#"{"client_id":"test-client","redirect_uri":"any-player://callback"}"#,
+        ));
+        assert_eq!(payload["ok"], Value::Bool(true));
+
+        let auth_url = payload["data"]["auth_url"]
+            .as_str()
+            .expect("auth_url should be a string");
+        let scope = url::Url::parse(auth_url)
+            .expect("auth_url should be valid")
+            .query_pairs()
+            .find_map(|(key, value)| (key == "scope").then(|| value.into_owned()))
+            .expect("auth_url should include scope");
+
+        assert_eq!(
+            scope,
+            "user-modify-playback-state user-read-playback-state user-read-email user-read-private"
+        );
+    }
+
+    #[test]
+    fn spotify_begin_auth_preserves_supplied_scopes() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
+        let payload = parse_json(&handle_spotify_begin_auth(
+            r#"{"client_id":"test-client","redirect_uri":"any-player://callback","scopes":["playlist-read-private","user-read-email"]}"#,
+        ));
+        assert_eq!(payload["ok"], Value::Bool(true));
+
+        let auth_url = payload["data"]["auth_url"]
+            .as_str()
+            .expect("auth_url should be a string");
+        let scope = url::Url::parse(auth_url)
+            .expect("auth_url should be valid")
+            .query_pairs()
+            .find_map(|(key, value)| (key == "scope").then(|| value.into_owned()))
+            .expect("auth_url should include scope");
+
+        assert_eq!(scope, "playlist-read-private user-read-email");
     }
 
     #[test]
