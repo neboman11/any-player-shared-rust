@@ -1,14 +1,6 @@
 [workspace]
 members = [
     "crates/any_player_core",
-    "crates/any_player_spotify_engine",
     "crates/any_player_ffi_android",
 ]
 resolver = "2"
-
-# Patch librespot-core to replace its build script which has a vergen-lib
-# version conflict (vergen-gitcl 1.0 pulls in vergen-lib 0.1 which conflicts
-# with vergen 9 / vergen-lib 9 used elsewhere). The patch keeps all source
-# unchanged and only strips the build-time vergen dependency.
-[patch.crates-io]
-librespot-core = { path = "patches/librespot-core" }
